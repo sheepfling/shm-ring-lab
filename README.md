@@ -130,10 +130,10 @@ build\windows-msvc-x64\Release\shm_ring_demo.exe cleanup showcase
 | Platform | Backend in the project | Verification status |
 | --- | --- | --- |
 | macOS | POSIX shared memory and named semaphore | On 2026-10-11, a native build and all 8 process-level correctness scenarios passed on macOS 26.6.2 arm64 with Apple Clang 21.0.0; the suite passed 3 consecutive runs. |
-| Linux | POSIX shared memory and named semaphore | Docker build/test scaffold is present; Linux has not been run because the Docker CLI cannot reach its daemon on this host. |
+| Linux | POSIX shared memory and named semaphore | On 2026-10-11, the Docker proof passed in Debian 12 (Bookworm) on LinuxKit 7.0.12 / aarch64, with GCC 12.2.0 and CMake 3.25.1: all 8 CTest scenarios passed 3 times, then 5,000 separate-process messages passed count, byte, and SHA-256 checks. |
 | Windows | Win32 file mapping and named mutex | MSVC x64 preset and PB-MSI checklist are present; a native build and tests have not yet run. |
 
-Treat Windows and Linux as intended targets until their native verification phases in [the backlog](docs/verification-backlog.md) are complete. The current macOS result does not prove either target.
+The Docker run proves the Linux aarch64 container route; it does not replace a native Linux host run. Windows still needs the PB-MSI native run. See [the verification backlog](docs/verification-backlog.md) for the remaining checks.
 
 ## How it works
 
