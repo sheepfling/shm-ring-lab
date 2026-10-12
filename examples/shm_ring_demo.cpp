@@ -25,13 +25,16 @@ void usage() {
     std::cerr <<
         "Usage:\n"
         "  shm_ring_demo create <name> [capacity] [max-payload-bytes]\n"
+        "  shm_ring_demo host <name> [capacity] [max-payload-bytes]\n"
         "  shm_ring_demo produce <name>\n"
         "  shm_ring_demo consume <name>\n"
         "  shm_ring_demo duplex <outgoing-name> <incoming-name>\n"
         "  shm_ring_demo cleanup <name>\n"
         "Producer reads stdin lines and closes its writer at EOF. Consumer drains\n"
         "messages and exits after the writer closes. Duplex runs one reader thread\n"
-        "and one stdin writer over two independent directional sessions.\n";
+        "and one stdin writer over two independent directional sessions. Host keeps\n"
+        "the created session open until Enter, which is required for named objects\n"
+        "on Windows.\n";
 }
 
 std::uint32_t parse_u32(const char* text, const char* label) {
@@ -113,6 +116,18 @@ int duplex(const std::string& outgoing_name, const std::string& incoming_name) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc >= 3 && std::string(argv[1]) == "host") {
+            shm_ring_lab::Options options;
+            if (argc > 3) options.capacity = parse_u32(argv[3], "capacity");
+            if (argc > 4) options.max_payload_bytes = parse_u32(argv[4], "max-payload-bytes");
+            if (argc > 5) { usage(); return 2; }
+            [[maybe_unused]] auto session = Session::create(argv[2], options);
+            std::cout << "Hosting '" << argv[2] << "'. Peers may connect; press Enter "
+                      << "after all peers exit to release the session handles.\n" << std::flush;
+            std::string line;
+            std::getline(std::cin, line);
+            return 0;
+        }
         if (argc >= 3 && std::string(argv[1]) == "create") {
             shm_ring_lab::Options options;
             if (argc > 3) options.capacity = parse_u32(argv[3], "capacity");

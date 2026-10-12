@@ -1,5 +1,6 @@
 #include "shm_ring_lab/session.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -73,16 +74,58 @@ std::wstring quote_argument(const std::wstring& arg) {
 
 class Child {
 public:
-    Child(const std::string& executable, const std::vector<std::string>& args) {
+    Child(const std::string& executable, const std::vector<std::string>& args,
+          bool watchdog_group = false) {
+        if (watchdog_group) {
+            job_ = ::CreateJobObjectW(nullptr, nullptr);
+            if (job_ == nullptr) throw std::runtime_error("CreateJobObjectW failed");
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!::SetInformationJobObject(job_, JobObjectExtendedLimitInformation,
+                    &limits, sizeof(limits))) {
+                const auto error = ::GetLastError();
+                ::CloseHandle(job_);
+                job_ = nullptr;
+                throw std::runtime_error("SetInformationJobObject failed (" + std::to_string(error) + ")");
+            }
+        }
         std::wstring command = quote_argument(widen(executable));
         for (const auto& arg : args) command += L" " + quote_argument(widen(arg));
         std::vector<wchar_t> mutable_command(command.begin(), command.end());
         mutable_command.push_back(L'\0');
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
+        const DWORD flags = CREATE_NO_WINDOW | (job_ != nullptr ? CREATE_SUSPENDED : 0U);
         if (!::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
-                              CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process_)) {
-            throw std::runtime_error("CreateProcessW failed (" + std::to_string(::GetLastError()) + ")");
+                              flags, nullptr, nullptr, &startup, &process_)) {
+            const auto error = ::GetLastError();
+            if (job_ != nullptr) ::CloseHandle(job_);
+            job_ = nullptr;
+            throw std::runtime_error("CreateProcessW failed (" + std::to_string(error) + ")");
+        }
+        if (job_ != nullptr) {
+            if (!::AssignProcessToJobObject(job_, process_.hProcess)) {
+                const auto error = ::GetLastError();
+                (void)::TerminateProcess(process_.hProcess, 137);
+                (void)::WaitForSingleObject(process_.hProcess, 5000);
+                ::CloseHandle(process_.hThread);
+                ::CloseHandle(process_.hProcess);
+                ::CloseHandle(job_);
+                process_ = {};
+                job_ = nullptr;
+                throw std::runtime_error("AssignProcessToJobObject failed (" + std::to_string(error) + ")");
+            }
+            if (::ResumeThread(process_.hThread) == static_cast<DWORD>(-1)) {
+                const auto error = ::GetLastError();
+                (void)::TerminateJobObject(job_, 137);
+                (void)::WaitForSingleObject(process_.hProcess, 5000);
+                ::CloseHandle(process_.hThread);
+                ::CloseHandle(process_.hProcess);
+                ::CloseHandle(job_);
+                process_ = {};
+                job_ = nullptr;
+                throw std::runtime_error("ResumeThread failed (" + std::to_string(error) + ")");
+            }
         }
         ::CloseHandle(process_.hThread);
         process_.hThread = nullptr;
@@ -103,7 +146,8 @@ public:
     }
     void terminate() noexcept {
         if (!finished_ && process_.hProcess != nullptr) {
-            (void)::TerminateProcess(process_.hProcess, 137);
+            if (job_ != nullptr) (void)::TerminateJobObject(job_, 137);
+            else (void)::TerminateProcess(process_.hProcess, 137);
             (void)::WaitForSingleObject(process_.hProcess, 5000);
             finished_ = true;
         }
@@ -113,8 +157,11 @@ private:
     void close_handles() noexcept {
         if (process_.hProcess != nullptr) ::CloseHandle(process_.hProcess);
         process_.hProcess = nullptr;
+        if (job_ != nullptr) ::CloseHandle(job_);
+        job_ = nullptr;
     }
     PROCESS_INFORMATION process_{};
+    HANDLE job_ = nullptr;
     bool finished_ = false;
 };
 
@@ -122,10 +169,12 @@ private:
 
 class Child {
 public:
-    Child(const std::string& executable, const std::vector<std::string>& args) {
+    Child(const std::string& executable, const std::vector<std::string>& args,
+          bool watchdog_group = false) : watchdog_group_(watchdog_group) {
         pid_ = ::fork();
         if (pid_ < 0) throw std::runtime_error("fork failed");
         if (pid_ == 0) {
+            if (watchdog_group_) (void)::setpgid(0, 0);
             std::vector<std::string> storage;
             storage.reserve(args.size() + 1);
             storage.push_back(executable);
@@ -137,6 +186,7 @@ public:
             ::execv(executable.c_str(), argv.data());
             ::_exit(127);
         }
+        if (watchdog_group_) (void)::setpgid(pid_, pid_);
     }
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
@@ -159,7 +209,7 @@ public:
     }
     void terminate() noexcept {
         if (!finished_ && pid_ > 0) {
-            (void)::kill(pid_, SIGKILL);
+            (void)::kill(watchdog_group_ ? -pid_ : pid_, SIGKILL);
             int status = 0;
             while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
             finished_ = true;
@@ -169,6 +219,7 @@ public:
 private:
     pid_t pid_ = -1;
     bool finished_ = false;
+    bool watchdog_group_ = false;
 };
 
 #endif
@@ -250,13 +301,16 @@ void test_dead_lock_owner_requires_recreate(const std::string& peer) {
         wait_marker(marker);
         int code = -1;
         expect(crashed.wait_for(3s, code) && code == 0, "lock-owner crash helper did not exit");
-        auto opened = Session::open(name);
-        const std::uint8_t value = 1;
         const auto start = std::chrono::steady_clock::now();
-        const auto status = opened.send(&value, 1, 200ms);
-        expect(status == Status::timeout || status == Status::peer_failed,
-               "abandoned synchronization state was treated as usable");
-        expect(std::chrono::steady_clock::now() - start < 1500ms,
+        bool rejected = false;
+        try {
+            auto opened = Session::open(name);
+            (void)opened;
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        expect(rejected, "abandoned synchronization state was treated as usable");
+        expect(std::chrono::steady_clock::now() - start < 3s,
                "dead synchronization owner blocked beyond the bound");
     }
     std::filesystem::remove(marker);
@@ -270,7 +324,87 @@ void test_dead_lock_owner_requires_recreate(const std::string& peer) {
     expect(Session::remove(replacement), "cleanup of replacement session failed");
 }
 
+void test_initialization_gate(const std::string& peer) {
+    const auto name = unique_name();
+    const auto marker = marker_path(name);
+    {
+        Child initializer(peer, {"partial-create", name, marker.string(), "300"});
+        wait_marker(marker);
+        const auto start = std::chrono::steady_clock::now();
+        auto opened = Session::open(name);
+        expect(opened.options().capacity == 2 && opened.options().max_payload_bytes == 16,
+               "opener observed incomplete creator options");
+        expect(std::chrono::steady_clock::now() - start < 2s,
+               "opener exceeded the initialization deadline");
+        wait_success(initializer, 2s, "delayed initializer");
+    }
+    std::filesystem::remove(marker);
+    expect(Session::remove(name), "cleanup after initialization race failed");
+
+    const auto aborted_name = unique_name();
+    const auto aborted_marker = marker_path(aborted_name);
+    Child abandoned_creator(peer, {"partial-abort", aborted_name, aborted_marker.string()});
+    wait_marker(aborted_marker);
+    const auto start = std::chrono::steady_clock::now();
+    bool rejected = false;
+    try {
+        auto incomplete = Session::open(aborted_name);
+        (void)incomplete;
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    expect(rejected, "incomplete shared-memory header was accepted");
+    expect(std::chrono::steady_clock::now() - start < 3s,
+           "incomplete initialization wait exceeded its bound");
+    abandoned_creator.terminate();
+    std::filesystem::remove(aborted_marker);
+    expect(Session::remove(aborted_name), "cleanup after aborted initialization failed");
+}
+
+void test_role_ownership(const std::string& peer) {
+    for (const auto* role : {"writer", "reader"}) {
+        const auto name = unique_name();
+        const auto marker = marker_path(name);
+        {
+            auto owner = Session::create(name, {2, 16});
+            Child holder(peer, {"hold-role", name, role, marker.string()});
+            wait_marker(marker);
+            Child competitor(peer, {"compete-role", name, role});
+            wait_success(competitor, 3s, "duplicate-role competitor");
+            holder.terminate();
+        }
+        std::filesystem::remove(marker);
+        expect(Session::remove(name), std::string("cleanup after duplicate ") + role + " test failed");
+    }
+}
+
 void test_size_and_frame_validation(const std::string& peer) {
+    const auto collision_name = unique_name();
+    {
+        auto first = Session::create(collision_name, {2, 4});
+        bool collision_rejected = false;
+        try {
+            auto duplicate = Session::create(collision_name, {2, 4});
+            (void)duplicate;
+        } catch (const std::runtime_error&) {
+            collision_rejected = true;
+        }
+        expect(collision_rejected, "exclusive create reused an active name");
+        expect(first.send(nullptr, 0, 100ms) == Status::ok,
+               "failed duplicate create damaged the original session");
+    }
+    expect(Session::remove(collision_name), "cleanup after exclusive-create test failed");
+
+    const auto case_name = unique_name();
+    auto mixed_case_name = case_name;
+    mixed_case_name.front() = 'S';
+    {
+        auto owner = Session::create(mixed_case_name, {2, 4});
+        auto opener = Session::open(case_name);
+        expect(opener.options().capacity == 2, "same-name opener rejected a valid session");
+    }
+    expect(Session::remove(case_name), "cleanup after name-normalization test failed");
+
     const auto size_name = unique_name();
     {
         auto session = Session::create(size_name, {2, 4});
@@ -313,6 +447,63 @@ void test_size_and_frame_validation(const std::string& peer) {
         expect(rejected, "incompatible protocol version was accepted");
     }
     expect(Session::remove(version_name), "cleanup after version test failed");
+
+    const auto layout_name = unique_name();
+    {
+        auto owner = Session::create(layout_name, {2, 4});
+        auto already_open = Session::open(layout_name);
+        Child corrupter(peer, {"corrupt-layout", layout_name});
+        wait_success(corrupter, 3s, "protocol-layout injector");
+        expect(owner.send(nullptr, 0, 100ms) == Status::invalid_frame,
+               "already-open session used a corrupted layout");
+        expect(already_open.send(nullptr, 0, 100ms) == Status::peer_failed,
+               "failed session was not rejected after corrupted layout");
+        bool rejected = false;
+        try {
+            auto incompatible = Session::open(layout_name);
+            (void)incompatible;
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        expect(rejected, "hostile declared mapping size was accepted");
+    }
+    expect(Session::remove(layout_name), "cleanup after layout test failed");
+
+    const auto short_name = unique_name();
+    {
+        Child short_mapping(peer, {"short-layout", short_name});
+        wait_success(short_mapping, 3s, "short-mapping injector");
+        bool rejected = false;
+        try {
+            auto invalid = Session::open(short_name);
+            (void)invalid;
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        expect(rejected, "header-declared layout larger than actual mapping was accepted");
+    }
+    expect(Session::remove(short_name), "cleanup after short-mapping test failed");
+
+    const auto index_name = unique_name();
+    {
+        auto session = Session::create(index_name, {2, 4});
+        Child corrupter(peer, {"corrupt-index", index_name});
+        wait_success(corrupter, 3s, "ring-index injector");
+        expect(session.send(nullptr, 0, 100ms) == Status::invalid_frame,
+               "out-of-range ring index was not rejected");
+        expect(session.receive(100ms).status == Status::peer_failed,
+               "session was not failed after a corrupt index");
+    }
+    expect(Session::remove(index_name), "cleanup after ring-index test failed");
+
+    bool limits_rejected = false;
+    try {
+        auto impossible = Session::create(unique_name(), {4096, 1024U * 1024U});
+        (void)impossible;
+    } catch (const std::invalid_argument&) {
+        limits_rejected = true;
+    }
+    expect(limits_rejected, "oversized capacity/payload product was not rejected");
 }
 
 void test_duplex_directional_channels(const std::string& peer) {
@@ -333,27 +524,54 @@ void test_duplex_directional_channels(const std::string& peer) {
 } // namespace
 
 int main(int argc, char** argv) {
+    struct TestCase {
+        const char* id;
+        const char* description;
+        void (*run)(const std::string&);
+    };
+    const std::vector<TestCase> tests = {
+        {"fifo", "FIFO ordering, wraparound, and shutdown", test_fifo_wraparound_and_shutdown},
+        {"empty", "empty receive timeout", test_empty_timeout},
+        {"full", "full backpressure and idle peer death", test_full_timeout_and_idle_peer_death},
+        {"dead-lock", "dead synchronization owner and recreate policy", test_dead_lock_owner_requires_recreate},
+        {"initialization", "creator/opener initialization gate", test_initialization_gate},
+        {"roles", "duplicate producer/consumer role rejection", test_role_ownership},
+        {"validation", "payload and hostile protocol validation", test_size_and_frame_validation},
+        {"duplex", "duplex independent directions", test_duplex_directional_channels},
+    };
+
+    if (argc == 4 && std::string(argv[1]) == "--case") {
+        const std::string id = argv[2];
+        const auto found = std::find_if(tests.begin(), tests.end(), [&](const TestCase& test) {
+            return id == test.id;
+        });
+        if (found == tests.end()) return 2;
+        try {
+            found->run(argv[3]);
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "worker " << found->id << ": " << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc != 2) {
         std::cerr << "usage: shm_ring_tests <test-peer-executable>\n";
         return 2;
     }
     const std::string peer = argv[1];
-    const std::vector<std::pair<const char*, void(*)(const std::string&)>> tests = {
-        {"FIFO ordering, wraparound, and shutdown", test_fifo_wraparound_and_shutdown},
-        {"empty receive timeout", test_empty_timeout},
-        {"full backpressure and idle peer death", test_full_timeout_and_idle_peer_death},
-        {"dead synchronization owner and recreate policy", test_dead_lock_owner_requires_recreate},
-        {"payload and protocol validation", test_size_and_frame_validation},
-        {"duplex independent directions", test_duplex_directional_channels},
-    };
+    const auto executable = std::filesystem::absolute(argv[0]).string();
     int failures = 0;
     for (const auto& test : tests) {
         try {
-            test.second(peer);
-            std::cout << "PASS " << test.first << '\n';
+            // Each scenario is isolated in a worker process. The parent owns
+            // an independent watchdog; POSIX process groups / Windows jobs
+            // ensure a timed-out worker cannot strand its endpoint children.
+            Child worker(executable, {"--case", test.id, peer}, true);
+            wait_success(worker, 10s, test.description);
+            std::cout << "PASS " << test.description << '\n';
         } catch (const std::exception& error) {
             ++failures;
-            std::cerr << "FAIL " << test.first << ": " << error.what() << '\n';
+            std::cerr << "FAIL " << test.description << ": " << error.what() << '\n';
         }
     }
     std::cout << (tests.size() - static_cast<std::size_t>(failures)) << "/" << tests.size()

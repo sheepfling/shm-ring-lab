@@ -40,8 +40,11 @@ class Session {
 public:
     static Session create(const std::string& name, Options options = {});
     static Session open(const std::string& name);
-    // POSIX removes the names immediately; Windows names disappear after the
-    // final mapping/mutex handles close. Call only after peers have stopped.
+    // Explicit lifecycle operation only: this cannot detect remote mappings.
+    // On POSIX, unlinking while a peer is mapped leaves that peer on the old
+    // object and permits a same-name create to split the session namespace.
+    // Call only after all peers have exited and can no longer open the name.
+    // Windows names disappear after the final mapping/mutex handles close.
     static bool remove(const std::string& name) noexcept;
 
     Session(Session&&) noexcept;

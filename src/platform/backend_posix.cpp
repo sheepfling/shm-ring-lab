@@ -25,9 +25,11 @@ std::string semaphore_name(const std::string& name) {
     return "/srlm_" + name;
 }
 
-void discard_partial(Mapping& mapping, const std::string& name) noexcept {
+void close_partial(Mapping& mapping) noexcept {
+    // Once O_EXCL publishes the shm name, do not unlink it on later failure.
+    // An opener may already hold the old object; reusing the name could split
+    // that peer from a newly created mapping.
     close(mapping);
-    (void)::shm_unlink(shared_memory_name(name).c_str());
 }
 
 } // namespace
@@ -47,40 +49,52 @@ Mapping create(const std::string& canonical_name, std::size_t bytes) {
     mapping.mapped_size = bytes;
     if (::ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
         const int error = errno;
-        discard_partial(mapping, canonical_name);
+        close_partial(mapping);
         throw std::runtime_error("ftruncate failed (errno " + std::to_string(error) + ")");
     }
     mapping.address = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapping.address == MAP_FAILED) {
         mapping.address = nullptr;
         const int error = errno;
-        discard_partial(mapping, canonical_name);
+        close_partial(mapping);
         throw std::runtime_error("mmap failed (errno " + std::to_string(error) + ")");
     }
     auto* semaphore = ::sem_open(sem_name.c_str(), O_CREAT | O_EXCL, 0600, 1);
     if (semaphore == SEM_FAILED) {
         const int error = errno;
-        discard_partial(mapping, canonical_name);
+        close_partial(mapping);
         throw std::runtime_error("sem_open(create) failed (errno " + std::to_string(error) + ")");
     }
     mapping.sync_handle = semaphore;
     return mapping;
 }
 
-Mapping open(const std::string& canonical_name) {
+Mapping open(const std::string& canonical_name, std::size_t initial_bytes) {
+    if (initial_bytes == 0 || initial_bytes > kMaxRegionSize) {
+        throw std::runtime_error("invalid initial mapping size");
+    }
     const auto shm_name = shared_memory_name(canonical_name);
     const auto sem_name = semaphore_name(canonical_name);
     Mapping mapping;
     const int fd = ::shm_open(shm_name.c_str(), O_RDWR, 0600);
     if (fd < 0) {
+        if (errno == ENOENT) throw NotReady("shared-memory name is not published yet");
         throw std::runtime_error("shm_open(open) failed for session '" + canonical_name + "' (errno " + std::to_string(errno) + ")");
     }
     mapping.object_handle = fd;
     struct stat info{};
-    if (::fstat(fd, &info) != 0 || info.st_size <= 0 || static_cast<std::uint64_t>(info.st_size) > kMaxRegionSize) {
+    if (::fstat(fd, &info) != 0) {
         const int error = errno;
         close(mapping);
-        throw std::runtime_error("shared-memory file has an invalid size (errno " + std::to_string(error) + ")");
+        throw std::runtime_error("fstat(shared memory) failed (errno " + std::to_string(error) + ")");
+    }
+    if (info.st_size == 0) {
+        close(mapping);
+        throw NotReady("shared-memory creator has not sized the object yet");
+    }
+    if (info.st_size < 0 || static_cast<std::uint64_t>(info.st_size) > kMaxRegionSize) {
+        close(mapping);
+        throw std::runtime_error("shared-memory file has an invalid size");
     }
     mapping.mapped_size = static_cast<std::size_t>(info.st_size);
     mapping.address = ::mmap(nullptr, mapping.mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -94,10 +108,15 @@ Mapping open(const std::string& canonical_name) {
     if (semaphore == SEM_FAILED) {
         const int error = errno;
         close(mapping);
+        if (error == ENOENT) throw NotReady("synchronization name is not published yet");
         throw std::runtime_error("sem_open(open) failed (errno " + std::to_string(error) + ")");
     }
     mapping.sync_handle = semaphore;
     return mapping;
+}
+
+bool ensure_mapped_size(Mapping& mapping, std::size_t required_bytes) noexcept {
+    return required_bytes <= mapping.mapped_size && required_bytes <= kMaxRegionSize;
 }
 
 void close(Mapping& mapping) noexcept {
@@ -128,10 +147,13 @@ LockResult lock_for(Mapping& mapping, std::chrono::milliseconds timeout) noexcep
     auto* semaphore = static_cast<sem_t*>(mapping.sync_handle);
     if (timeout < std::chrono::milliseconds::zero()) timeout = std::chrono::milliseconds::zero();
     const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool first_attempt = true;
     for (;;) {
-        int result;
-        do { result = ::sem_trywait(semaphore); } while (result != 0 && errno == EINTR);
+        if (!first_attempt && std::chrono::steady_clock::now() >= deadline) return LockResult::timeout;
+        first_attempt = false;
+        const int result = ::sem_trywait(semaphore);
         if (result == 0) return LockResult::acquired;
+        if (errno == EINTR) continue;
         if (errno != EAGAIN) return LockResult::failed;
         if (std::chrono::steady_clock::now() >= deadline) return LockResult::timeout;
         std::this_thread::sleep_for(std::min(std::chrono::milliseconds(1),

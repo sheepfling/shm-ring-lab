@@ -41,7 +41,7 @@ add_executable(shm_ring_tests tests/integration.cpp)
 target_link_libraries(shm_ring_tests PRIVATE shm_ring_lab Threads::Threads)
 add_test(NAME shm_ring_correctness
     COMMAND shm_ring_tests $<TARGET_FILE:shm_ring_test_peer>)
-set_tests_properties(shm_ring_correctness PROPERTIES TIMEOUT 45)
+set_tests_properties(shm_ring_correctness PROPERTIES TIMEOUT 90)
 
 if(BUILD_BENCHMARKS)
     add_executable(shm_ring_bench_peer benchmarks/bench_peer.cpp)

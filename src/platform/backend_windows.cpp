@@ -31,14 +31,6 @@ std::intptr_t as_integer(HANDLE value) noexcept {
     return reinterpret_cast<std::intptr_t>(value);
 }
 
-std::size_t mapped_region_size(void* address) {
-    MEMORY_BASIC_INFORMATION info{};
-    if (::VirtualQuery(address, &info, sizeof(info)) == 0) {
-        throw std::runtime_error(windows_error("VirtualQuery", ::GetLastError()));
-    }
-    return static_cast<std::size_t>(info.RegionSize);
-}
-
 } // namespace
 
 Mapping create(const std::string& canonical_name, std::size_t bytes) {
@@ -65,13 +57,7 @@ Mapping create(const std::string& canonical_name, std::size_t bytes) {
         ::CloseHandle(object);
         throw std::runtime_error(windows_error("MapViewOfFile(create)", error));
     }
-    try {
-        mapping.mapped_size = mapped_region_size(mapping.address);
-    } catch (...) {
-        ::UnmapViewOfFile(mapping.address);
-        ::CloseHandle(object);
-        throw;
-    }
+    mapping.mapped_size = bytes;
     ::SetLastError(ERROR_SUCCESS);
     const auto mutex = ::CreateMutexW(nullptr, FALSE, mutex_name(canonical_name).c_str());
     if (mutex == nullptr) {
@@ -90,35 +76,51 @@ Mapping create(const std::string& canonical_name, std::size_t bytes) {
     return mapping;
 }
 
-Mapping open(const std::string& canonical_name) {
+Mapping open(const std::string& canonical_name, std::size_t initial_bytes) {
+    if (initial_bytes == 0 || initial_bytes > 64U * 1024U * 1024U) {
+        throw std::runtime_error("invalid initial mapping size");
+    }
     const auto object = ::OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, mapping_name(canonical_name).c_str());
     if (object == nullptr) {
-        throw std::runtime_error(windows_error("OpenFileMappingW", ::GetLastError()));
+        const DWORD error = ::GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND) throw NotReady("mapping name is not published yet");
+        throw std::runtime_error(windows_error("OpenFileMappingW", error));
     }
     Mapping mapping;
     mapping.object_handle = as_integer(object);
-    mapping.address = ::MapViewOfFile(object, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    mapping.address = ::MapViewOfFile(object, FILE_MAP_ALL_ACCESS, 0, 0, initial_bytes);
     if (mapping.address == nullptr) {
         const DWORD error = ::GetLastError();
         ::CloseHandle(object);
         throw std::runtime_error(windows_error("MapViewOfFile(open)", error));
     }
-    try {
-        mapping.mapped_size = mapped_region_size(mapping.address);
-    } catch (...) {
-        ::UnmapViewOfFile(mapping.address);
-        ::CloseHandle(object);
-        throw;
-    }
+    mapping.mapped_size = initial_bytes;
     const auto mutex = ::OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mutex_name(canonical_name).c_str());
     if (mutex == nullptr) {
         const DWORD error = ::GetLastError();
         ::UnmapViewOfFile(mapping.address);
         ::CloseHandle(object);
+        if (error == ERROR_FILE_NOT_FOUND) throw NotReady("mutex name is not published yet");
         throw std::runtime_error(windows_error("OpenMutexW", error));
     }
     mapping.sync_handle = mutex;
     return mapping;
+}
+
+bool ensure_mapped_size(Mapping& mapping, std::size_t required_bytes) noexcept {
+    if (required_bytes == 0 || required_bytes > 64U * 1024U * 1024U ||
+        mapping.object_handle == -1 || mapping.address == nullptr) {
+        return false;
+    }
+    if (required_bytes <= mapping.mapped_size) return true;
+    ::UnmapViewOfFile(mapping.address);
+    mapping.address = nullptr;
+    mapping.mapped_size = 0;
+    mapping.address = ::MapViewOfFile(as_handle(mapping.object_handle), FILE_MAP_ALL_ACCESS,
+                                      0, 0, required_bytes);
+    if (mapping.address == nullptr) return false;
+    mapping.mapped_size = required_bytes;
+    return true;
 }
 
 void close(Mapping& mapping) noexcept {

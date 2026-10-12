@@ -9,9 +9,17 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace std::chrono_literals;
 using shm_ring_lab::Session;
@@ -109,6 +117,24 @@ int claim_and_wait(const std::string& name, const std::string& ready_path) {
     return 0;
 }
 
+int hold_role(const std::string& name, const std::string& role, const std::string& ready_path) {
+    auto session = Session::open(name);
+    const auto status = role == "writer" ? session.claim_writer() : session.claim_reader();
+    check(status, "claim held role");
+    write_ready(ready_path);
+    std::this_thread::sleep_for(30s);
+    return 0;
+}
+
+int compete_role(const std::string& name, const std::string& role) {
+    auto session = Session::open(name);
+    const auto status = role == "writer" ? session.claim_writer() : session.claim_reader();
+    if (status != Status::role_in_use) {
+        throw std::runtime_error("a second process was not rejected from the claimed role");
+    }
+    return 0;
+}
+
 int wait_on_empty_then_receive(const std::string& name, const std::string& ready_path) {
     auto session = Session::open(name);
     check(session.claim_reader(), "claim_reader");
@@ -129,7 +155,7 @@ int wait_on_empty_then_receive(const std::string& name, const std::string& ready
 }
 
 int crash_while_holding_lock(const std::string& name, const std::string& ready_path) {
-    auto mapping = shm_ring_lab::detail::platform::open(name);
+    auto mapping = shm_ring_lab::detail::platform::open(name, sizeof(shm_ring_lab::detail::SharedHeader));
     if (shm_ring_lab::detail::platform::lock_for(mapping, 5s) !=
         shm_ring_lab::detail::platform::LockResult::acquired) {
         throw std::runtime_error("test child could not acquire the platform lock");
@@ -140,12 +166,17 @@ int crash_while_holding_lock(const std::string& name, const std::string& ready_p
 }
 
 int corrupt_frame(const std::string& name) {
-    auto mapping = shm_ring_lab::detail::platform::open(name);
+    auto mapping = shm_ring_lab::detail::platform::open(name, sizeof(shm_ring_lab::detail::SharedHeader));
     if (shm_ring_lab::detail::platform::lock_for(mapping, 2s) !=
         shm_ring_lab::detail::platform::LockResult::acquired) {
         throw std::runtime_error("test child could not acquire the platform lock");
     }
     auto* header = static_cast<shm_ring_lab::detail::SharedHeader*>(mapping.address);
+    if (!shm_ring_lab::detail::platform::ensure_mapped_size(mapping,
+            static_cast<std::size_t>(header->mapping_size))) {
+        throw std::runtime_error("test mapping does not contain its declared ring layout");
+    }
+    header = static_cast<shm_ring_lab::detail::SharedHeader*>(mapping.address);
     header->read_index = 0;
     header->write_index = 1;
     header->count = 1;
@@ -159,13 +190,107 @@ int corrupt_frame(const std::string& name) {
 }
 
 int corrupt_version(const std::string& name) {
-    auto mapping = shm_ring_lab::detail::platform::open(name);
+    auto mapping = shm_ring_lab::detail::platform::open(name, sizeof(shm_ring_lab::detail::SharedHeader));
     if (shm_ring_lab::detail::platform::lock_for(mapping, 2s) !=
         shm_ring_lab::detail::platform::LockResult::acquired) {
         throw std::runtime_error("test child could not acquire the platform lock");
     }
     auto* header = static_cast<shm_ring_lab::detail::SharedHeader*>(mapping.address);
     header->protocol_version = shm_ring_lab::detail::kProtocolVersion + 1U;
+    shm_ring_lab::detail::platform::unlock(mapping);
+    shm_ring_lab::detail::platform::close(mapping);
+    return 0;
+}
+
+int corrupt_layout(const std::string& name) {
+    auto mapping = shm_ring_lab::detail::platform::open(name, sizeof(shm_ring_lab::detail::SharedHeader));
+    if (shm_ring_lab::detail::platform::lock_for(mapping, 2s) !=
+        shm_ring_lab::detail::platform::LockResult::acquired) {
+        throw std::runtime_error("test child could not acquire the platform lock");
+    }
+    auto* header = static_cast<shm_ring_lab::detail::SharedHeader*>(mapping.address);
+    header->mapping_size = UINT64_MAX;
+    shm_ring_lab::detail::platform::unlock(mapping);
+    shm_ring_lab::detail::platform::close(mapping);
+    return 0;
+}
+
+int corrupt_index(const std::string& name) {
+    auto mapping = shm_ring_lab::detail::platform::open(name, sizeof(shm_ring_lab::detail::SharedHeader));
+    if (shm_ring_lab::detail::platform::lock_for(mapping, 2s) !=
+        shm_ring_lab::detail::platform::LockResult::acquired) {
+        throw std::runtime_error("test child could not acquire the platform lock");
+    }
+    auto* header = static_cast<shm_ring_lab::detail::SharedHeader*>(mapping.address);
+    header->write_index = header->capacity;
+    shm_ring_lab::detail::platform::unlock(mapping);
+    shm_ring_lab::detail::platform::close(mapping);
+    return 0;
+}
+
+int create_short_layout(const std::string& name) {
+#ifdef _WIN32
+    SYSTEM_INFO system_info{};
+    ::GetSystemInfo(&system_info);
+    const auto page = static_cast<std::size_t>(system_info.dwPageSize);
+#else
+    const auto page_value = ::sysconf(_SC_PAGESIZE);
+    if (page_value <= 0) throw std::runtime_error("could not query the OS page size");
+    const auto page = static_cast<std::size_t>(page_value);
+#endif
+    if (page == 0 || page > shm_ring_lab::detail::kMaxPayloadBytes) {
+        throw std::runtime_error("OS page size exceeds test payload limit");
+    }
+    std::size_t declared_size = 0;
+    if (!shm_ring_lab::detail::compute_mapping_size(2, static_cast<std::uint32_t>(page), declared_size) ||
+        declared_size <= page) {
+        throw std::runtime_error("test layout calculation failed");
+    }
+    auto mapping = shm_ring_lab::detail::platform::create(name, page);
+    if (shm_ring_lab::detail::platform::lock_for(mapping, 2s) !=
+        shm_ring_lab::detail::platform::LockResult::acquired) {
+        throw std::runtime_error("test child could not acquire the platform lock");
+    }
+    auto* header = new (mapping.address) shm_ring_lab::detail::SharedHeader{};
+    header->protocol_version = shm_ring_lab::detail::kProtocolVersion;
+    header->header_size = static_cast<std::uint32_t>(sizeof(*header));
+    header->mapping_size = declared_size;
+    header->capacity = 2;
+    header->max_payload_bytes = static_cast<std::uint32_t>(page);
+    header->magic = shm_ring_lab::detail::kProtocolMagic;
+    shm_ring_lab::detail::platform::unlock(mapping);
+    shm_ring_lab::detail::platform::close(mapping);
+    return 0;
+}
+
+int partial_create(const std::string& name, const std::string& ready_path,
+                   std::uint32_t delay_ms, bool publish_header) {
+    std::size_t bytes = 0;
+    if (!shm_ring_lab::detail::compute_mapping_size(2, 16, bytes)) {
+        throw std::runtime_error("test layout calculation failed");
+    }
+    if (publish_header) {
+        write_ready(ready_path);
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms / 2U));
+    }
+    auto mapping = shm_ring_lab::detail::platform::create(name, bytes);
+    if (!publish_header) {
+        write_ready(ready_path);
+        std::this_thread::sleep_for(30s);
+        return 0;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms - delay_ms / 2U));
+    if (shm_ring_lab::detail::platform::lock_for(mapping, 2s) !=
+        shm_ring_lab::detail::platform::LockResult::acquired) {
+        throw std::runtime_error("test initializer could not acquire the platform lock");
+    }
+    auto* header = new (mapping.address) shm_ring_lab::detail::SharedHeader{};
+    header->protocol_version = shm_ring_lab::detail::kProtocolVersion;
+    header->header_size = static_cast<std::uint32_t>(sizeof(*header));
+    header->mapping_size = bytes;
+    header->capacity = 2;
+    header->max_payload_bytes = 16;
+    header->magic = shm_ring_lab::detail::kProtocolMagic;
     shm_ring_lab::detail::platform::unlock(mapping);
     shm_ring_lab::detail::platform::close(mapping);
     return 0;
@@ -185,10 +310,21 @@ int main(int argc, char** argv) {
             return duplex(argv[2], argv[3], argv[4], argv[5], static_cast<std::uint32_t>(std::stoul(argv[6])));
         }
         if (argc == 4 && std::string(argv[1]) == "claim-wait") return claim_and_wait(argv[2], argv[3]);
+        if (argc == 5 && std::string(argv[1]) == "hold-role") return hold_role(argv[2], argv[3], argv[4]);
+        if (argc == 4 && std::string(argv[1]) == "compete-role") return compete_role(argv[2], argv[3]);
         if (argc == 4 && std::string(argv[1]) == "empty-wait") return wait_on_empty_then_receive(argv[2], argv[3]);
         if (argc == 4 && std::string(argv[1]) == "crash-lock") return crash_while_holding_lock(argv[2], argv[3]);
         if (argc == 3 && std::string(argv[1]) == "corrupt-frame") return corrupt_frame(argv[2]);
         if (argc == 3 && std::string(argv[1]) == "corrupt-version") return corrupt_version(argv[2]);
+        if (argc == 3 && std::string(argv[1]) == "corrupt-layout") return corrupt_layout(argv[2]);
+        if (argc == 3 && std::string(argv[1]) == "corrupt-index") return corrupt_index(argv[2]);
+        if (argc == 3 && std::string(argv[1]) == "short-layout") return create_short_layout(argv[2]);
+        if (argc == 5 && std::string(argv[1]) == "partial-create") {
+            return partial_create(argv[2], argv[3], static_cast<std::uint32_t>(std::stoul(argv[4])), true);
+        }
+        if (argc == 4 && std::string(argv[1]) == "partial-abort") {
+            return partial_create(argv[2], argv[3], 0, false);
+        }
         return 2;
     } catch (const std::exception& error) {
         std::cerr << "test peer: " << error.what() << '\n';

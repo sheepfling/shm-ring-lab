@@ -66,14 +66,29 @@ std::chrono::milliseconds remaining_until(Clock::time_point deadline) noexcept {
 }
 
 detail::platform::LockResult lock_until(detail::platform::Mapping& mapping,
-                                        Clock::time_point deadline) noexcept {
+                                        Clock::time_point deadline,
+                                        bool allow_nonblocking_try = false) noexcept {
     for (;;) {
-        const bool expired = Clock::now() >= deadline;
-        const auto remaining = expired ? std::chrono::milliseconds::zero() : remaining_until(deadline);
-        const auto slice = expired ? std::chrono::milliseconds::zero() :
-            std::min(remaining, std::chrono::milliseconds(10));
+        if (Clock::now() >= deadline) {
+            if (!allow_nonblocking_try) return detail::platform::LockResult::timeout;
+            const auto result = detail::platform::lock_for(mapping, std::chrono::milliseconds::zero());
+            return result;
+        }
+        const auto remaining = remaining_until(deadline);
+        const auto slice = std::min(remaining, std::chrono::milliseconds(10));
         const auto result = detail::platform::lock_for(mapping, slice);
-        if (result != detail::platform::LockResult::timeout || expired) return result;
+        if (result == detail::platform::LockResult::timeout) {
+            if (Clock::now() >= deadline) return result;
+            continue;
+        }
+        if (Clock::now() >= deadline && result == detail::platform::LockResult::acquired) {
+            detail::platform::unlock(mapping);
+            return detail::platform::LockResult::timeout;
+        }
+        // Preserve Windows WAIT_ABANDONED even if the scheduler returned it
+        // just after the deadline; hiding it as a timeout would make the
+        // already-acquired mutex appear healthy to the next caller.
+        return result;
     }
 }
 
@@ -85,11 +100,41 @@ struct Guard {
     ~Guard() { if (mapping != nullptr) detail::platform::unlock(*mapping); }
 };
 
+Status validate_locked_state(detail::platform::Mapping& mapping,
+                             detail::SharedHeader& header,
+                             Options expected) noexcept {
+    if (header.failed > 1 || header.writer_closed > 1 || header.reserved != 0 ||
+        header.magic != detail::kProtocolMagic ||
+        header.protocol_version != detail::kProtocolVersion ||
+        header.header_size != sizeof(detail::SharedHeader) ||
+        header.capacity != expected.capacity ||
+        header.max_payload_bytes != expected.max_payload_bytes) {
+        header.failed = 1;
+        return Status::invalid_frame;
+    }
+    if (header.failed == 1) return Status::peer_failed;
+
+    std::size_t required_size = 0;
+    if (header.capacity < 2 || header.capacity > detail::kMaxCapacity ||
+        header.max_payload_bytes == 0 || header.max_payload_bytes > detail::kMaxPayloadBytes ||
+        !detail::compute_mapping_size(header.capacity, header.max_payload_bytes, required_size) ||
+        header.mapping_size != required_size || required_size > mapping.mapped_size ||
+        header.read_index >= header.capacity || header.write_index >= header.capacity ||
+        header.count > header.capacity ||
+        header.write_index != (header.read_index + header.count) % header.capacity) {
+        header.failed = 1;
+        return Status::invalid_frame;
+    }
+    return Status::ok;
+}
+
 Status claim(detail::platform::Mapping& mapping,
              detail::SharedHeader& header,
              std::uint64_t& owner_pid,
+             Options expected,
              std::chrono::milliseconds timeout) {
-    const auto lock_result = lock_until(mapping, deadline_from(bounded_timeout(timeout)));
+    const auto bounded = bounded_timeout(timeout);
+    const auto lock_result = lock_until(mapping, deadline_from(bounded), bounded == std::chrono::milliseconds::zero());
     if (lock_result == detail::platform::LockResult::timeout) {
         return Status::timeout;
     }
@@ -101,9 +146,8 @@ Status claim(detail::platform::Mapping& mapping,
         header.failed = 1;
         return Status::peer_failed;
     }
-    if (header.failed != 0) {
-        return Status::peer_failed;
-    }
+    const auto state = validate_locked_state(mapping, header, expected);
+    if (state != Status::ok) return state;
     const auto current_pid = detail::platform::process_id();
     if (owner_pid == 0) {
         owner_pid = current_pid;
@@ -112,7 +156,7 @@ Status claim(detail::platform::Mapping& mapping,
     return owner_pid == current_pid ? Status::ok : Status::role_in_use;
 }
 
-void validate_header(const detail::platform::Mapping& mapping) {
+std::size_t validate_header(const detail::platform::Mapping& mapping, bool require_full_mapping) {
     if (mapping.address == nullptr || mapping.mapped_size < sizeof(detail::SharedHeader)) {
         throw std::runtime_error("shared-memory region is smaller than a protocol header");
     }
@@ -128,9 +172,11 @@ void validate_header(const detail::platform::Mapping& mapping) {
     }
     std::size_t required_size = 0;
     if (!detail::compute_mapping_size(header.capacity, header.max_payload_bytes, required_size) ||
-        header.mapping_size != required_size || required_size > mapping.mapped_size) {
+        header.mapping_size != required_size ||
+        (require_full_mapping && required_size > mapping.mapped_size)) {
         throw std::runtime_error("shared-memory protocol layout size is invalid");
     }
+    return required_size;
 }
 
 } // namespace
@@ -140,10 +186,9 @@ struct Session::Impl {
     detail::SharedHeader* header = nullptr;
     Options configured_options{};
 
-    explicit Impl(detail::platform::Mapping value) : mapping(value) {
+    explicit Impl(detail::platform::Mapping value, Options options)
+        : mapping(value), configured_options(options) {
         header = static_cast<detail::SharedHeader*>(mapping.address);
-        configured_options.capacity = header->capacity;
-        configured_options.max_payload_bytes = header->max_payload_bytes;
     }
     ~Impl() { detail::platform::close(mapping); }
 };
@@ -167,26 +212,108 @@ Session Session::create(const std::string& name, Options options) {
     }
 
     auto mapping = detail::platform::create(canonical_name, mapping_size);
-    auto* header = new (mapping.address) detail::SharedHeader{};
-    header->magic = detail::kProtocolMagic;
-    header->protocol_version = detail::kProtocolVersion;
-    header->header_size = static_cast<std::uint32_t>(sizeof(detail::SharedHeader));
-    header->mapping_size = mapping_size;
-    header->capacity = options.capacity;
-    header->max_payload_bytes = options.max_payload_bytes;
-    return Session(std::make_unique<Impl>(mapping));
+    std::unique_ptr<Impl> impl;
+    try {
+        impl = std::make_unique<Impl>(mapping, options);
+        const auto lock_result = lock_until(mapping, Clock::now() + std::chrono::seconds(1));
+        if (lock_result == detail::platform::LockResult::timeout ||
+            lock_result == detail::platform::LockResult::failed) {
+            throw std::runtime_error("could not acquire the new session initialization lock");
+        }
+        Guard guard(mapping);
+        if (lock_result == detail::platform::LockResult::abandoned) {
+            throw std::runtime_error("new session synchronization object was unexpectedly abandoned");
+        }
+        auto* header = new (mapping.address) detail::SharedHeader{};
+        header->protocol_version = detail::kProtocolVersion;
+        header->header_size = static_cast<std::uint32_t>(sizeof(detail::SharedHeader));
+        header->mapping_size = mapping_size;
+        header->capacity = options.capacity;
+        header->max_payload_bytes = options.max_payload_bytes;
+        // Publish the ready marker last while holding the named lock. Openers
+        // serialize on that same lock and retry while magic remains zero.
+        header->magic = detail::kProtocolMagic;
+    } catch (...) {
+        if (impl) impl.reset();
+        else detail::platform::close(mapping);
+        // Keep a possibly published partial namespace reserved. Unlinking here
+        // could split peers that opened it during initialization; cleanup is an
+        // explicit caller action after confirming no peer remains mapped.
+        throw;
+    }
+    return Session(std::move(impl));
 }
 
 Session Session::open(const std::string& name) {
     const auto canonical_name = canonicalize_name(name);
-    auto mapping = detail::platform::open(canonical_name);
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    detail::platform::Mapping mapping;
+    for (;;) {
+        try {
+            mapping = detail::platform::open(canonical_name, sizeof(detail::SharedHeader));
+            break;
+        } catch (const detail::platform::NotReady&) {
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error("timed out waiting for session names to be published");
+            }
+            std::this_thread::sleep_for(std::min(std::chrono::milliseconds(1), remaining_until(deadline)));
+        }
+    }
+    bool ready = false;
+    std::unique_ptr<Impl> impl;
     try {
-        validate_header(mapping);
+        while (!ready) {
+            const auto lock_result = lock_until(mapping, deadline);
+            if (lock_result == detail::platform::LockResult::timeout) {
+                throw std::runtime_error("timed out waiting for session initialization or synchronization");
+            }
+            if (lock_result == detail::platform::LockResult::failed) {
+                throw std::runtime_error("session synchronization failed while opening");
+            }
+            Guard guard(mapping);
+            if (lock_result == detail::platform::LockResult::abandoned) {
+                if (mapping.mapped_size >= sizeof(detail::SharedHeader)) {
+                    auto* header = static_cast<detail::SharedHeader*>(mapping.address);
+                    if (header->magic == detail::kProtocolMagic &&
+                        header->protocol_version == detail::kProtocolVersion &&
+                        header->header_size == sizeof(detail::SharedHeader)) {
+                        header->failed = 1;
+                    }
+                }
+                throw std::runtime_error("session synchronization owner died; discard this session");
+            }
+            if (mapping.mapped_size < sizeof(detail::SharedHeader)) {
+                throw std::runtime_error("shared-memory region is smaller than a protocol header");
+            }
+            auto* header = static_cast<detail::SharedHeader*>(mapping.address);
+            if (header->magic == 0) {
+                guard.mapping = nullptr;
+                detail::platform::unlock(mapping);
+            } else {
+                const auto required_size = validate_header(mapping, false);
+                if (!detail::platform::ensure_mapped_size(mapping, required_size)) {
+                    throw std::runtime_error("shared-memory object is smaller than its declared layout");
+                }
+                const auto checked_size = validate_header(mapping, true);
+                if (checked_size != required_size) {
+                    throw std::runtime_error("shared-memory layout changed while opening");
+                }
+                const auto* initialized = static_cast<const detail::SharedHeader*>(mapping.address);
+                impl = std::make_unique<Impl>(mapping,
+                    Options{initialized->capacity, initialized->max_payload_bytes});
+                ready = true;
+            }
+            if (!ready && Clock::now() >= deadline) {
+                throw std::runtime_error("session header remained uninitialized");
+            }
+            if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     } catch (...) {
-        detail::platform::close(mapping);
+        if (impl) impl.reset();
+        else detail::platform::close(mapping);
         throw;
     }
-    return Session(std::make_unique<Impl>(mapping));
+    return Session(std::move(impl));
 }
 
 bool Session::remove(const std::string& name) noexcept {
@@ -199,12 +326,14 @@ bool Session::remove(const std::string& name) noexcept {
 
 Status Session::claim_writer(std::chrono::milliseconds timeout) {
     if (!impl_) return Status::invalid_argument;
-    return claim(impl_->mapping, *impl_->header, impl_->header->writer_pid, timeout);
+    return claim(impl_->mapping, *impl_->header, impl_->header->writer_pid,
+                 impl_->configured_options, timeout);
 }
 
 Status Session::claim_reader(std::chrono::milliseconds timeout) {
     if (!impl_) return Status::invalid_argument;
-    return claim(impl_->mapping, *impl_->header, impl_->header->reader_pid, timeout);
+    return claim(impl_->mapping, *impl_->header, impl_->header->reader_pid,
+                 impl_->configured_options, timeout);
 }
 
 Status Session::send(const Message& message, std::chrono::milliseconds timeout) {
@@ -218,7 +347,7 @@ Status Session::send(const void* data, std::size_t size, std::chrono::millisecon
 
     const auto deadline = deadline_from(timeout);
     for (;;) {
-        const auto lock_result = lock_until(impl_->mapping, deadline);
+        const auto lock_result = lock_until(impl_->mapping, deadline, timeout <= std::chrono::milliseconds::zero());
         if (lock_result == detail::platform::LockResult::timeout) return Status::timeout;
         if (lock_result == detail::platform::LockResult::failed) return Status::peer_failed;
         Guard guard(impl_->mapping);
@@ -227,12 +356,8 @@ Status Session::send(const void* data, std::size_t size, std::chrono::millisecon
             return Status::peer_failed;
         }
         auto& header = *impl_->header;
-        if (header.failed != 0) return Status::peer_failed;
-        if (header.read_index >= header.capacity || header.write_index >= header.capacity ||
-            header.count > header.capacity) {
-            header.failed = 1;
-            return Status::invalid_frame;
-        }
+        const auto state = validate_locked_state(impl_->mapping, header, impl_->configured_options);
+        if (state != Status::ok) return state;
         const auto current_pid = detail::platform::process_id();
         if (header.writer_pid == 0) header.writer_pid = current_pid;
         if (header.writer_pid != current_pid) return Status::role_in_use;
@@ -261,7 +386,7 @@ ReceiveResult Session::receive(std::chrono::milliseconds timeout) {
     if (!impl_) return {Status::invalid_argument, {}};
     const auto deadline = deadline_from(timeout);
     for (;;) {
-        const auto lock_result = lock_until(impl_->mapping, deadline);
+        const auto lock_result = lock_until(impl_->mapping, deadline, timeout <= std::chrono::milliseconds::zero());
         if (lock_result == detail::platform::LockResult::timeout) return {Status::timeout, {}};
         if (lock_result == detail::platform::LockResult::failed) return {Status::peer_failed, {}};
         Guard guard(impl_->mapping);
@@ -270,12 +395,8 @@ ReceiveResult Session::receive(std::chrono::milliseconds timeout) {
             header.failed = 1;
             return {Status::peer_failed, {}};
         }
-        if (header.failed != 0) return {Status::peer_failed, {}};
-        if (header.read_index >= header.capacity || header.write_index >= header.capacity ||
-            header.count > header.capacity) {
-            header.failed = 1;
-            return {Status::invalid_frame, {}};
-        }
+        const auto state = validate_locked_state(impl_->mapping, header, impl_->configured_options);
+        if (state != Status::ok) return {state, {}};
         const auto current_pid = detail::platform::process_id();
         if (header.reader_pid == 0) header.reader_pid = current_pid;
         if (header.reader_pid != current_pid) return {Status::role_in_use, {}};
@@ -308,7 +429,8 @@ ReceiveResult Session::receive(std::chrono::milliseconds timeout) {
 
 Status Session::close_writer(std::chrono::milliseconds timeout) {
     if (!impl_) return Status::invalid_argument;
-    const auto lock_result = lock_until(impl_->mapping, deadline_from(bounded_timeout(timeout)));
+    const auto bounded = bounded_timeout(timeout);
+    const auto lock_result = lock_until(impl_->mapping, deadline_from(bounded), bounded == std::chrono::milliseconds::zero());
     if (lock_result == detail::platform::LockResult::timeout) return Status::timeout;
     if (lock_result == detail::platform::LockResult::failed) return Status::peer_failed;
     Guard guard(impl_->mapping);
@@ -317,7 +439,8 @@ Status Session::close_writer(std::chrono::milliseconds timeout) {
         header.failed = 1;
         return Status::peer_failed;
     }
-    if (header.failed != 0) return Status::peer_failed;
+    const auto state = validate_locked_state(impl_->mapping, header, impl_->configured_options);
+    if (state != Status::ok) return state;
     const auto current_pid = detail::platform::process_id();
     if (header.writer_pid == 0) header.writer_pid = current_pid;
     if (header.writer_pid != current_pid) return Status::role_in_use;
