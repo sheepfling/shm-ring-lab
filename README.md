@@ -150,4 +150,19 @@ Messages are limited to 1 MiB each and rings to 4096 slots (the mapping is cappe
 
 Sessions are transient, not durable. A crashed process does not trigger frame recovery. POSIX named semaphores cannot recover a lock permit abandoned by a dead process; Windows reports an abandoned mutex and this implementation fails the session. Discard that session and use a fresh name. On POSIX, call `cleanup` only after every peer has exited and can no longer open the name; unlinking earlier can split peers across two objects. See the [V1 protocol notes](docs/protocol-v1.md) for the full contract.
 
+## Python teaching examples
+
+The [Python SPSC ring guide](docs/python-teaching-guide.md) walks from a
+threaded four-slot ring to a process-shared fixed-layout byte ring. Both use
+locks and conditions to teach publication, release, FIFO behavior, timeouts,
+and shutdown; they do not replace or alter the production C++ transport. Run
+them with the standard library:
+
+```sh
+python3 examples/python/threaded_spsc.py
+python3 examples/python/threaded_spsc.py --test
+python3 examples/python/process_spsc.py
+python3 examples/python/process_spsc.py --test
+```
+
 Build files and showcase output are ignored by Git. The benchmark helper is non-gating and has not been run; no throughput claims are made.
