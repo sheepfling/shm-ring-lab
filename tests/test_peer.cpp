@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <new>
@@ -42,6 +43,16 @@ void write_ready(const std::string& path) {
     marker << "ready\n";
     marker.flush();
     if (!marker) throw std::runtime_error("failed to write readiness marker");
+}
+
+void wait_for_release(const std::string& path) {
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!std::filesystem::exists(path)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("short-layout release handshake exceeded 5 seconds");
+        }
+        std::this_thread::sleep_for(5ms);
+    }
 }
 
 int produce(const std::string& name, std::uint32_t count, const std::string& prefix) {
@@ -228,7 +239,8 @@ int corrupt_index(const std::string& name) {
     return 0;
 }
 
-int create_short_layout(const std::string& name) {
+int create_short_layout(const std::string& name, const std::string& ready_path,
+                        const std::string& release_path) {
 #ifdef _WIN32
     SYSTEM_INFO system_info{};
     ::GetSystemInfo(&system_info);
@@ -259,6 +271,13 @@ int create_short_layout(const std::string& name) {
     header->max_payload_bytes = static_cast<std::uint32_t>(page);
     header->magic = shm_ring_lab::detail::kProtocolMagic;
     shm_ring_lab::detail::platform::unlock(mapping);
+    try {
+        write_ready(ready_path);
+        wait_for_release(release_path);
+    } catch (...) {
+        shm_ring_lab::detail::platform::close(mapping);
+        throw;
+    }
     shm_ring_lab::detail::platform::close(mapping);
     return 0;
 }
@@ -318,7 +337,9 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::string(argv[1]) == "corrupt-version") return corrupt_version(argv[2]);
         if (argc == 3 && std::string(argv[1]) == "corrupt-layout") return corrupt_layout(argv[2]);
         if (argc == 3 && std::string(argv[1]) == "corrupt-index") return corrupt_index(argv[2]);
-        if (argc == 3 && std::string(argv[1]) == "short-layout") return create_short_layout(argv[2]);
+        if (argc == 5 && std::string(argv[1]) == "short-layout") {
+            return create_short_layout(argv[2], argv[3], argv[4]);
+        }
         if (argc == 5 && std::string(argv[1]) == "partial-create") {
             return partial_create(argv[2], argv[3], static_cast<std::uint32_t>(std::stoul(argv[4])), true);
         }

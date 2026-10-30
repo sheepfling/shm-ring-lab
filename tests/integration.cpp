@@ -1,9 +1,11 @@
 #include "shm_ring_lab/session.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -16,6 +18,7 @@
 #else
 #include <cerrno>
 #include <csignal>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -43,6 +46,13 @@ std::string unique_name() {
 
 std::filesystem::path marker_path(const std::string& name) {
     return std::filesystem::temp_directory_path() / (name + ".ready");
+}
+
+void write_text_file(const std::filesystem::path& path, const std::string& contents) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    file.flush();
+    expect(static_cast<bool>(file), "failed to write test input/handshake file " + path.string());
 }
 
 #ifdef _WIN32
@@ -75,7 +85,7 @@ std::wstring quote_argument(const std::wstring& arg) {
 class Child {
 public:
     Child(const std::string& executable, const std::vector<std::string>& args,
-          bool watchdog_group = false) {
+          bool watchdog_group = false, const std::filesystem::path& stdin_file = {}) {
         if (watchdog_group) {
             job_ = ::CreateJobObjectW(nullptr, nullptr);
             if (job_ == nullptr) throw std::runtime_error("CreateJobObjectW failed");
@@ -95,13 +105,49 @@ public:
         mutable_command.push_back(L'\0');
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
+        HANDLE input_handle = INVALID_HANDLE_VALUE;
+        HANDLE null_handle = INVALID_HANDLE_VALUE;
+        BOOL inherit_handles = FALSE;
+        if (!stdin_file.empty()) {
+            SECURITY_ATTRIBUTES attributes{};
+            attributes.nLength = sizeof(attributes);
+            attributes.bInheritHandle = TRUE;
+            input_handle = ::CreateFileW(stdin_file.c_str(), GENERIC_READ,
+                                         FILE_SHARE_READ, &attributes, OPEN_EXISTING,
+                                         FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (input_handle == INVALID_HANDLE_VALUE) {
+                const auto error = ::GetLastError();
+                if (job_ != nullptr) ::CloseHandle(job_);
+                job_ = nullptr;
+                throw std::runtime_error("CreateFileW(stdin) failed (" + std::to_string(error) + ")");
+            }
+            null_handle = ::CreateFileW(L"NUL", GENERIC_WRITE,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (null_handle == INVALID_HANDLE_VALUE) {
+                const auto error = ::GetLastError();
+                ::CloseHandle(input_handle);
+                if (job_ != nullptr) ::CloseHandle(job_);
+                job_ = nullptr;
+                throw std::runtime_error("CreateFileW(NUL) failed (" + std::to_string(error) + ")");
+            }
+            startup.dwFlags = STARTF_USESTDHANDLES;
+            startup.hStdInput = input_handle;
+            startup.hStdOutput = null_handle;
+            startup.hStdError = null_handle;
+            inherit_handles = TRUE;
+        }
         const DWORD flags = CREATE_NO_WINDOW | (job_ != nullptr ? CREATE_SUSPENDED : 0U);
-        if (!::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
-                              flags, nullptr, nullptr, &startup, &process_)) {
-            const auto error = ::GetLastError();
+        const BOOL created = ::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr,
+                                              inherit_handles, flags, nullptr, nullptr,
+                                              &startup, &process_);
+        const auto create_error = created ? ERROR_SUCCESS : ::GetLastError();
+        if (input_handle != INVALID_HANDLE_VALUE) ::CloseHandle(input_handle);
+        if (null_handle != INVALID_HANDLE_VALUE) ::CloseHandle(null_handle);
+        if (!created) {
             if (job_ != nullptr) ::CloseHandle(job_);
             job_ = nullptr;
-            throw std::runtime_error("CreateProcessW failed (" + std::to_string(error) + ")");
+            throw std::runtime_error("CreateProcessW failed (" + std::to_string(create_error) + ")");
         }
         if (job_ != nullptr) {
             if (!::AssignProcessToJobObject(job_, process_.hProcess)) {
@@ -170,11 +216,31 @@ private:
 class Child {
 public:
     Child(const std::string& executable, const std::vector<std::string>& args,
-          bool watchdog_group = false) : watchdog_group_(watchdog_group) {
+          bool watchdog_group = false, const std::filesystem::path& stdin_file = {})
+        : watchdog_group_(watchdog_group) {
         pid_ = ::fork();
         if (pid_ < 0) throw std::runtime_error("fork failed");
         if (pid_ == 0) {
             if (watchdog_group_) (void)::setpgid(0, 0);
+            if (!stdin_file.empty()) {
+                const int input = ::open(stdin_file.c_str(), O_RDONLY);
+                if (input < 0) ::_exit(126);
+                if (input != STDIN_FILENO) {
+                    if (::dup2(input, STDIN_FILENO) < 0) ::_exit(126);
+                    (void)::close(input);
+                }
+                const int null_output = ::open("/dev/null", O_WRONLY);
+                if (null_output < 0) ::_exit(126);
+                if ((null_output != STDOUT_FILENO &&
+                     ::dup2(null_output, STDOUT_FILENO) < 0) ||
+                    (null_output != STDERR_FILENO &&
+                     ::dup2(null_output, STDERR_FILENO) < 0)) {
+                    ::_exit(126);
+                }
+                if (null_output != STDOUT_FILENO && null_output != STDERR_FILENO) {
+                    (void)::close(null_output);
+                }
+            }
             std::vector<std::string> storage;
             storage.reserve(args.size() + 1);
             storage.push_back(executable);
@@ -469,20 +535,53 @@ void test_size_and_frame_validation(const std::string& peer) {
     }
     expect(Session::remove(layout_name), "cleanup after layout test failed");
 
-    const auto short_name = unique_name();
-    {
-        Child short_mapping(peer, {"short-layout", short_name});
-        wait_success(short_mapping, 3s, "short-mapping injector");
-        bool rejected = false;
-        try {
-            auto invalid = Session::open(short_name);
-            (void)invalid;
-        } catch (const std::runtime_error&) {
-            rejected = true;
-        }
-        expect(rejected, "header-declared layout larger than actual mapping was accepted");
+    const auto missing_name = unique_name();
+    std::string missing_error;
+    const auto missing_start = std::chrono::steady_clock::now();
+    try {
+        auto missing = Session::open(missing_name);
+        (void)missing;
+    } catch (const std::runtime_error& error) {
+        missing_error = error.what();
     }
-    expect(Session::remove(short_name), "cleanup after short-mapping test failed");
+    expect(missing_error == "timed out waiting for session names to be published",
+           "missing-name control produced an unexpected rejection: " + missing_error);
+    expect(std::chrono::steady_clock::now() - missing_start < 3s,
+           "missing-name timeout control exceeded its bound");
+
+    const auto short_name = unique_name();
+    const auto short_ready = marker_path(short_name);
+    const auto short_release = std::filesystem::temp_directory_path() /
+                               (short_name + ".release");
+    std::string short_layout_error;
+    std::filesystem::remove(short_ready);
+    std::filesystem::remove(short_release);
+    try {
+        {
+            Child short_mapping(peer, {"short-layout", short_name,
+                                       short_ready.string(), short_release.string()});
+            wait_marker(short_ready);
+            try {
+                auto invalid = Session::open(short_name);
+                (void)invalid;
+            } catch (const std::runtime_error& error) {
+                short_layout_error = error.what();
+            }
+            write_text_file(short_release, "release\n");
+            wait_success(short_mapping, 3s, "short-mapping injector");
+        }
+    } catch (...) {
+        std::filesystem::remove(short_ready);
+        std::filesystem::remove(short_release);
+        (void)Session::remove(short_name);
+        throw;
+    }
+    const bool short_removed = Session::remove(short_name);
+    std::filesystem::remove(short_ready);
+    std::filesystem::remove(short_release);
+    expect(short_layout_error == "shared-memory object is smaller than its declared layout",
+           "short-layout mapping produced an unexpected rejection: " + short_layout_error);
+    expect(short_removed, "cleanup after short-mapping test failed");
 
     const auto index_name = unique_name();
     {
@@ -521,6 +620,139 @@ void test_duplex_directional_channels(const std::string& peer) {
     expect(Session::remove(b_to_a), "cleanup of B-to-A direction failed");
 }
 
+void test_duplex_cli_teardown(const std::string&, const std::string& demo) {
+    const auto failed_outgoing = unique_name();
+    const auto failed_incoming = unique_name();
+    const auto failed_input = std::filesystem::temp_directory_path() /
+                              (failed_outgoing + ".input");
+    try {
+        {
+            auto outgoing = Session::create(failed_outgoing, {2, 4});
+            auto incoming = Session::create(failed_incoming, {2, 4});
+            write_text_file(failed_input, "12345\n");
+            Child failing(demo, {"duplex", failed_outgoing, failed_incoming},
+                          false, failed_input);
+            const auto start = std::chrono::steady_clock::now();
+            int exit_code = -1;
+            expect(failing.wait_for(3s, exit_code),
+                   "duplex CLI hung after an oversized outbound message with an idle open input ring");
+            expect(std::chrono::steady_clock::now() - start < 3s,
+                   "duplex CLI send-error teardown exceeded its 3-second bound");
+            expect(exit_code != 0, "duplex CLI returned success after an oversized outbound message");
+        }
+        std::filesystem::remove(failed_input);
+        expect(Session::remove(failed_outgoing), "cleanup of failed duplex outgoing session failed");
+        expect(Session::remove(failed_incoming), "cleanup of failed duplex incoming session failed");
+    } catch (...) {
+        std::filesystem::remove(failed_input);
+        (void)Session::remove(failed_outgoing);
+        (void)Session::remove(failed_incoming);
+        throw;
+    }
+
+    const auto clean_outgoing = unique_name();
+    const auto clean_incoming = unique_name();
+    const auto clean_input = std::filesystem::temp_directory_path() /
+                             (clean_outgoing + ".input");
+    try {
+        {
+            auto outgoing = Session::create(clean_outgoing, {2, 4});
+            auto incoming = Session::create(clean_incoming, {2, 4});
+            const char reply[] = "ack";
+            expect(incoming.send(reply, sizeof(reply) - 1, 100ms) == Status::ok,
+                   "clean duplex control could not queue its inbound message");
+            expect(incoming.close_writer(100ms) == Status::ok,
+                   "clean duplex control could not close its inbound writer");
+            write_text_file(clean_input, "ping\n");
+            Child clean(demo, {"duplex", clean_outgoing, clean_incoming},
+                        false, clean_input);
+            wait_success(clean, 3s, "duplex CLI clean-close control");
+        }
+        std::filesystem::remove(clean_input);
+        expect(Session::remove(clean_outgoing), "cleanup of clean duplex outgoing session failed");
+        expect(Session::remove(clean_incoming), "cleanup of clean duplex incoming session failed");
+    } catch (...) {
+        std::filesystem::remove(clean_input);
+        (void)Session::remove(clean_outgoing);
+        (void)Session::remove(clean_incoming);
+        throw;
+    }
+
+    const auto flood_outgoing = unique_name();
+    const auto flood_incoming = unique_name();
+    const auto flood_input = std::filesystem::temp_directory_path() /
+                             (flood_outgoing + ".input");
+    constexpr std::uint32_t flood_capacity = 64;
+    std::atomic<bool> keep_flooding{true};
+    std::atomic<std::uint32_t> successful_flood_sends{0};
+    std::thread flooder;
+    bool sustained_input_seen_while_alive = false;
+    bool flood_child_exited = false;
+    std::chrono::milliseconds flood_child_runtime{0};
+    int flood_exit_code = -1;
+    try {
+        {
+            auto outgoing = Session::create(flood_outgoing, {2, 4});
+            auto incoming = Session::create(flood_incoming, {flood_capacity, 4});
+            write_text_file(flood_input, "one\ntwo\ntri\n");
+            const auto child_start = std::chrono::steady_clock::now();
+            Child failing(demo, {"duplex", flood_outgoing, flood_incoming},
+                          false, flood_input);
+            try {
+                flooder = std::thread([&] {
+                    const std::uint8_t message = 1;
+                    while (keep_flooding.load()) {
+                        const auto status = incoming.send(&message, sizeof(message), 100ms);
+                        if (status == Status::ok) {
+                            successful_flood_sends.fetch_add(1);
+                        } else if (status != Status::timeout) {
+                            return;
+                        }
+                    }
+                });
+
+                const auto child_deadline = child_start + 8s;
+                while (std::chrono::steady_clock::now() < child_deadline) {
+                    if (failing.wait_for(10ms, flood_exit_code)) {
+                        flood_child_exited = true;
+                        break;
+                    }
+                    if (successful_flood_sends.load() >= flood_capacity * 2) {
+                        sustained_input_seen_while_alive = true;
+                    }
+                }
+                flood_child_runtime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - child_start);
+                if (!flood_child_exited) failing.terminate();
+            } catch (...) {
+                keep_flooding.store(false);
+                if (flooder.joinable()) flooder.join();
+                throw;
+            }
+            keep_flooding.store(false);
+            flooder.join();
+        }
+        std::filesystem::remove(flood_input);
+        expect(Session::remove(flood_outgoing), "cleanup of flood duplex outgoing session failed");
+        expect(Session::remove(flood_incoming), "cleanup of flood duplex incoming session failed");
+    } catch (...) {
+        keep_flooding.store(false);
+        if (flooder.joinable()) flooder.join();
+        std::filesystem::remove(flood_input);
+        (void)Session::remove(flood_outgoing);
+        (void)Session::remove(flood_incoming);
+        throw;
+    }
+    expect(sustained_input_seen_while_alive,
+           "continuous-input duplex regression did not sustain inbound sends while the demo was alive");
+    expect(flood_child_runtime >= 4s,
+           "continuous-input duplex regression did not reach the outgoing backpressure timeout");
+    expect(flood_child_exited,
+           "duplex CLI hung after an outbound timeout while inbound messages kept arriving");
+    expect(flood_exit_code != 0,
+           "duplex CLI returned success after its outbound send timed out");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -528,6 +760,7 @@ int main(int argc, char** argv) {
         const char* id;
         const char* description;
         void (*run)(const std::string&);
+        void (*run_with_demo)(const std::string&, const std::string&) = nullptr;
     };
     const std::vector<TestCase> tests = {
         {"fifo", "FIFO ordering, wraparound, and shutdown", test_fifo_wraparound_and_shutdown},
@@ -538,27 +771,32 @@ int main(int argc, char** argv) {
         {"roles", "duplicate producer/consumer role rejection", test_role_ownership},
         {"validation", "payload and hostile protocol validation", test_size_and_frame_validation},
         {"duplex", "duplex independent directions", test_duplex_directional_channels},
+        {"duplex-cli", "duplex CLI error teardown under idle/flood input and clean close", nullptr,
+         test_duplex_cli_teardown},
     };
 
-    if (argc == 4 && std::string(argv[1]) == "--case") {
+    if (argc == 5 && std::string(argv[1]) == "--case") {
         const std::string id = argv[2];
         const auto found = std::find_if(tests.begin(), tests.end(), [&](const TestCase& test) {
             return id == test.id;
         });
         if (found == tests.end()) return 2;
         try {
-            found->run(argv[3]);
+            if (found->run != nullptr) found->run(argv[3]);
+            else if (found->run_with_demo != nullptr) found->run_with_demo(argv[3], argv[4]);
+            else return 2;
             return 0;
         } catch (const std::exception& error) {
             std::cerr << "worker " << found->id << ": " << error.what() << '\n';
             return 1;
         }
     }
-    if (argc != 2) {
-        std::cerr << "usage: shm_ring_tests <test-peer-executable>\n";
+    if (argc != 3) {
+        std::cerr << "usage: shm_ring_tests <test-peer-executable> <demo-executable>\n";
         return 2;
     }
     const std::string peer = argv[1];
+    const std::string demo = argv[2];
     const auto executable = std::filesystem::absolute(argv[0]).string();
     int failures = 0;
     for (const auto& test : tests) {
@@ -566,7 +804,7 @@ int main(int argc, char** argv) {
             // Each scenario is isolated in a worker process. The parent owns
             // an independent watchdog; POSIX process groups / Windows jobs
             // ensure a timed-out worker cannot strand its endpoint children.
-            Child worker(executable, {"--case", test.id, peer}, true);
+            Child worker(executable, {"--case", test.id, peer, demo}, true);
             wait_success(worker, 10s, test.description);
             std::cout << "PASS " << test.description << '\n';
         } catch (const std::exception& error) {

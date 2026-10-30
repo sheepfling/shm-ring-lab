@@ -82,8 +82,11 @@ int duplex(const std::string& outgoing_name, const std::string& incoming_name) {
     std::mutex output_mutex;
     std::thread reader([&] {
         for (;;) {
+            if (reader_failed.load()) return;
             auto result = incoming.receive(1s);
-            if (result.status == Status::timeout) continue;
+            if (result.status == Status::timeout) {
+                continue;
+            }
             if (result.status == Status::closed) return;
             if (result.status != Status::ok) {
                 reader_failed.store(true);
