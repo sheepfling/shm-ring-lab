@@ -24,13 +24,27 @@ git --version
 
 If Python is missing or too old, install a current signed macOS package from
 [python.org](https://www.python.org/downloads/macos/); open a new Terminal and
-check `python3 --version` again. Clone the project in the usual location if it
-is not already present:
+check `python3 --version` again.
+
+For a fresh checkout:
 
 ```sh
 mkdir -p ~/GIT/sheepfling
-git clone https://github.com/sheepfling/shm-ring-lab.git ~/GIT/sheepfling/shm-ring-lab
+git clone --branch feature/initial-work --single-branch https://github.com/sheepfling/shm-ring-lab.git ~/GIT/sheepfling/shm-ring-lab
 cd ~/GIT/sheepfling/shm-ring-lab
+```
+
+If `~/GIT/sheepfling/shm-ring-lab` already exists, do not clone over it. Inspect it first:
+
+```sh
+git -C ~/GIT/sheepfling/shm-ring-lab status --short --branch
+```
+
+If it is not a Git checkout, or it has modifications or untracked files, leave it untouched and clone into another empty directory. If it is a clean checkout, fetch and select the tutorial branch explicitly:
+
+```sh
+git -C ~/GIT/sheepfling/shm-ring-lab fetch origin feature/initial-work
+git -C ~/GIT/sheepfling/shm-ring-lab switch --detach FETCH_HEAD
 ```
 
 Run the Python examples below; they need only Python. To build the existing
@@ -98,6 +112,20 @@ SharedMemory is storage, not synchronization. The GIL is not shared between
 processes. `RawValue` supplies shared storage, not atomic increments; the common
 condition lock protects all access to its values and the slot bytes.
 
+### Timeout scope
+
+In both examples, `put` and `get` enter `with self.condition` before waiting.
+Acquiring that lock has no per-call timeout. The threaded example sets its
+deadline before acquiring but cannot interrupt a blocked acquire; the process
+example starts `Condition.wait_for(timeout=...)` only after acquiring the
+lock. `Condition.wait` and `wait_for` must reacquire the lock before returning.
+These timeouts bound the queue wait after lock acquisition; contention during
+acquisition or reacquisition can extend the call. A process killed while
+holding the process-shared lock can leave its peer blocked indefinitely. This
+differs from the native API's deadline-bounded lock acquisition. Neither
+Python example recovers an abandoned lock; discard the process ring after
+abnormal termination.
+
 ```mermaid
 flowchart LR
     subgraph ring[Process-shared state]
@@ -132,7 +160,7 @@ lock-free variant. Its operations map as follows:
 | Acquire before inspecting state | Enter the shared condition lock in `put` or `get` | `lock_until` then `platform::lock_for` in [`session.cpp:68–90`](../src/session.cpp#L68); backend contract [`backend.hpp:30–31`](../src/platform/backend.hpp#L30) |
 | Producer write and publish | Encode before lock; copy slot bytes, advance write index, increment count, notify | Copy length and payload, advance write index, increment count under the platform lock in [`session.cpp:366–376`](../src/session.cpp#L366) |
 | Consumer read and release | Copy slot to private bytes, advance read index, decrement count, notify; decode outside lock | Copy into private `Message`, advance read index, decrement count in [`session.cpp:404–418`](../src/session.cpp#L404) |
-| Full/empty wait | `Condition.wait_for` releases and reacquires the lock; predicate is rechecked | Unlock, poll until deadline, reacquire in [`session.cpp:379–382`](../src/session.cpp#L379) and [`session.cpp:424–427`](../src/session.cpp#L424) |
+| Full/empty wait | `Condition.wait` / `Condition.wait_for` releases and reacquires; timeout does not bound condition-lock acquisition/reacquisition | Unlock, poll with the operation deadline, reacquire using that deadline in [`session.cpp:379–382`](../src/session.cpp#L379) and [`session.cpp:424–427`](../src/session.cpp#L424) |
 | Normal end of stream | Set closed under lock and notify; child drains, exits, parent joins and unlinks | `close_writer()` sets `writer_closed`; receive drains then reports closed in [`session.cpp:430–448`](../src/session.cpp#L430) |
 
 The native acquire side is successful `lock_for`: POSIX calls `sem_trywait`

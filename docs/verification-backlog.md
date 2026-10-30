@@ -1,6 +1,8 @@
 # Verification backlog
 
-The private HTTPS origin exists but has no branch refs; no local changes have been pushed. No CI run or Umbra integration is part of this project. Record actual compiler/OS and exact command output when advancing a phase.
+This backlog combines dated local results with the current review state. Draft PR #1 publishes the base C++ project and Python tutorial on `feature/initial-work`; the October 18 paired IPC benchmark remains separate local work and is not included in the PR.
+
+The October 30 check found no PR reviews, status contexts, or PR-triggered workflow runs. Do not treat the dated local runs below as CI results. No Umbra integration is part of this project. Record actual compiler/OS and exact command output when advancing a phase.
 
 ## Phase 0 — local macOS development
 
