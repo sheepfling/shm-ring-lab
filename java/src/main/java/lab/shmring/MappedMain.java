@@ -11,6 +11,8 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Process harness for the actual shared mapped-file backend. */
 public final class MappedMain {
@@ -23,6 +25,8 @@ public final class MappedMain {
             selftest();
         } else if ("scenario".equals(args[0]) && args.length == 2) {
             scenario(Path.of(args[1]));
+        } else if ("large-map".equals(args[0]) && args.length == 2) {
+            largeMapTest(Path.of(args[1]));
         } else if ("host-test".equals(args[0]) && args.length == 6) {
             hostTest(Path.of(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]),
                     Path.of(args[4]), Path.of(args[5]));
@@ -74,6 +78,79 @@ public final class MappedMain {
                     "end-of-stream was not observed");
         }
         System.out.println("PASS mapped-file FIFO, wraparound, deadlines, validation, and close");
+        concurrentCloseTest(path.resolveSibling("close-race.mapped"));
+    }
+
+    private static void concurrentCloseTest(Path path) throws Exception {
+        MappedFileRing ring = MappedFileRing.create(path, 2, 16);
+        require(ring.send(bytes("one"), OP_TIMEOUT) == MappedFileRing.Status.OK, "close-race enqueue one failed");
+        require(ring.send(bytes("two"), OP_TIMEOUT) == MappedFileRing.Status.OK, "close-race enqueue two failed");
+        CountDownLatch started = new CountDownLatch(1);
+        AtomicReference<MappedFileRing.Status> result = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread sender = new Thread(() -> {
+            started.countDown();
+            try {
+                result.set(ring.send(bytes("blocked"), Duration.ofMillis(600)));
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        }, "mapped-close-race-sender");
+        sender.start();
+        try {
+            require(started.await(2, TimeUnit.SECONDS), "close-race sender did not start");
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (sender.getState() != Thread.State.TIMED_WAITING && System.nanoTime() < deadline) {
+                Thread.sleep(1);
+            }
+            require(sender.getState() == Thread.State.TIMED_WAITING,
+                    "close-race sender did not enter its bounded full-ring wait");
+            long closeStart = System.nanoTime();
+            ring.close();
+            long closeElapsed = elapsedMillis(closeStart);
+            sender.join(1500);
+            require(!sender.isAlive(), "close-race sender did not finish after close waited");
+            require(failure.get() == null, "close interrupted an active operation: " + failure.get());
+            require(result.get() == MappedFileRing.Status.TIMEOUT, "active send did not finish with timeout");
+            require(closeElapsed >= 100 && closeElapsed < 2000,
+                    "close did not wait for the active send deadline: " + closeElapsed + " ms");
+            boolean closedOperationRejected = false;
+            try {
+                ring.send(bytes("after-close"), Duration.ZERO);
+            } catch (IOException expected) {
+                closedOperationRejected = expected.getMessage().contains("mapped session is closed");
+            }
+            require(closedOperationRejected, "operation after close was not rejected as closed");
+            System.out.println("PASS close waits for active operation and rejects later sends (" + closeElapsed + " ms)");
+        } finally {
+            if (sender.isAlive()) {
+                ring.close();
+                sender.join(1500);
+                if (sender.isAlive()) {
+                    sender.interrupt();
+                    sender.join(1500);
+                }
+            }
+            ring.close();
+        }
+    }
+
+    private static void largeMapTest(Path path) throws Exception {
+        int maxPayload = 16 * 1024 * 1024;
+        try (MappedFileRing ring = MappedFileRing.create(path, 2, maxPayload)) {
+            require(ring.maxPayloadBytes() == maxPayload, "large mapped capacity mismatch");
+        }
+        try (MappedFileRing ring = MappedFileRing.open(path)) {
+            long start = System.nanoTime();
+            require(ring.receive(Duration.ofMillis(20)).status == MappedFileRing.Status.TIMEOUT,
+                    "large mapped empty receive did not time out");
+            long elapsed = elapsedMillis(start);
+            require(elapsed < 2000, "large mapped poll exceeded 2 seconds");
+            require(ring.send(bytes("sparse-map"), OP_TIMEOUT) == MappedFileRing.Status.OK,
+                    "large mapped send failed");
+            require(text(ring.receive(OP_TIMEOUT)).equals("sparse-map"), "large mapped receive failed");
+            System.out.println("PASS 32 MiB mapped-file poll and transfer (" + elapsed + " ms timeout call)");
+        }
     }
 
     private static void hostTest(Path path, int capacity, int maxBytes, Path ready, Path stop) throws Exception {
@@ -144,8 +221,19 @@ public final class MappedMain {
         try {
             Process localTest = child("scenario", local.toString());
             children.add(localTest);
-            await("mapped scenario", localTest, Duration.ofSeconds(10));
+            String scenarioOutput = await("mapped scenario", localTest, Duration.ofSeconds(10));
+            require(scenarioOutput.contains("PASS close waits for active operation"),
+                    "mapped close-race regression did not report its pass");
             Files.delete(local); // subprocess exit proves its mapping lifetime has ended
+            Files.delete(directory.resolve("close-race.mapped"));
+
+            Path large = directory.resolve("large.mapped");
+            Process largeTest = child("large-map", large.toString());
+            children.add(largeTest);
+            String largeOutput = await("large mapped poll", largeTest, Duration.ofSeconds(10));
+            require(largeOutput.contains("PASS 32 MiB mapped-file poll"),
+                    "large mapping check did not report its pass");
+            Files.delete(large);
 
             Process host = child("host-test", session.toString(), "16", "32", ready.toString(), stop.toString());
             children.add(host);
@@ -173,7 +261,7 @@ public final class MappedMain {
             Files.delete(ready);
             Files.delete(stop);
             Files.delete(directory);
-            System.out.println("PASS mapped shared-file transfer across three JVMs and post-exit cleanup");
+            System.out.println("PASS mapped transfer across three JVMs, 32 MiB poll, close-race, and post-exit cleanup");
         } finally {
             for (Process child : children) terminate(child);
             if (Files.exists(stop)) Files.deleteIfExists(stop);
@@ -197,7 +285,7 @@ public final class MappedMain {
         return new ProcessBuilder(command).redirectErrorStream(true).start();
     }
 
-    private static void await(String name, Process process, Duration timeout) throws Exception {
+    private static String await(String name, Process process, Duration timeout) throws Exception {
         if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
             process.destroyForcibly();
             process.waitFor(3, TimeUnit.SECONDS);
@@ -206,6 +294,7 @@ public final class MappedMain {
         String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
         require(process.exitValue() == 0, name + " failed: " + output);
         require(output.startsWith("PASS "), name + " returned unexpected output: " + output);
+        return output;
     }
 
     private static void terminate(Process process) throws InterruptedException {

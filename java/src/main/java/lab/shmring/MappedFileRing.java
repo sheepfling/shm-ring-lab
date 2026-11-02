@@ -18,6 +18,7 @@ import java.util.EnumSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /** Shared mapped-file SPSC ring. The file layout is private to this Java implementation. */
 public final class MappedFileRing implements AutoCloseable {
@@ -45,6 +46,7 @@ public final class MappedFileRing implements AutoCloseable {
     private final ReentrantLock localLock;
     private final int capacity;
     private final int maxPayload;
+    private final ReentrantReadWriteLock lifecycle = new ReentrantReadWriteLock(true);
     private MappedByteBuffer mapping;
 
     private MappedFileRing(Path path, FileChannel channel, MappedByteBuffer mapping,
@@ -78,7 +80,7 @@ public final class MappedFileRing implements AutoCloseable {
             mapping.putLong(WRITE_SEQUENCE, 0);
             mapping.putLong(READ_SEQUENCE, 0);
             mapping.putInt(WRITER_CLOSED, 0);
-            mapping.force();
+            mapping.force(0, HEADER_BYTES);
             return new MappedFileRing(normalized, channel, mapping, capacity, maxPayload);
         } catch (IOException | RuntimeException error) {
             channel.close();
@@ -98,7 +100,8 @@ public final class MappedFileRing implements AutoCloseable {
             }
             MappedByteBuffer mapping = channel.map(FileChannel.MapMode.READ_WRITE, 0, byteCount);
             mapping.order(ByteOrder.LITTLE_ENDIAN);
-            mapping.load();
+            // Read only the header pages needed for validation. load() is a paging
+            // hint with potentially mapping-wide I/O cost, not a visibility barrier.
             int capacity = mapping.getInt(8);
             int maxPayload = mapping.getInt(12);
             long expectedBytes = HEADER_BYTES + (long) capacity * (Integer.BYTES + (long) maxPayload);
@@ -117,6 +120,16 @@ public final class MappedFileRing implements AutoCloseable {
     public int maxPayloadBytes() { return maxPayload; }
 
     public Status send(byte[] payload, Duration timeout) throws IOException, InterruptedException {
+        lifecycle.readLock().lock();
+        try {
+            currentMapping();
+            return sendWhileOpen(payload, timeout);
+        } finally {
+            lifecycle.readLock().unlock();
+        }
+    }
+
+    private Status sendWhileOpen(byte[] payload, Duration timeout) throws IOException, InterruptedException {
         if (payload == null) return Status.INVALID_ARGUMENT;
         if (payload.length > maxPayload) return Status.TOO_LARGE;
         long deadline = deadline(timeout);
@@ -125,7 +138,6 @@ public final class MappedFileRing implements AutoCloseable {
             try (Guard guard = lockUntil(deadline)) {
                 if (guard == null) return Status.TIMEOUT;
                 MappedByteBuffer map = currentMapping();
-                map.load();
                 Header header = readHeader(map);
                 if (header == null) return Status.INVALID_FRAME;
                 if (header.closed) return Status.CLOSED;
@@ -145,13 +157,22 @@ public final class MappedFileRing implements AutoCloseable {
     }
 
     public Receive receive(Duration timeout) throws IOException, InterruptedException {
+        lifecycle.readLock().lock();
+        try {
+            currentMapping();
+            return receiveWhileOpen(timeout);
+        } finally {
+            lifecycle.readLock().unlock();
+        }
+    }
+
+    private Receive receiveWhileOpen(Duration timeout) throws IOException, InterruptedException {
         long deadline = deadline(timeout);
         int stride = Integer.BYTES + maxPayload;
         while (true) {
             try (Guard guard = lockUntil(deadline)) {
                 if (guard == null) return new Receive(Status.TIMEOUT, new byte[0]);
                 MappedByteBuffer map = currentMapping();
-                map.load();
                 Header header = readHeader(map);
                 if (header == null) return new Receive(Status.INVALID_FRAME, new byte[0]);
                 if (header.read < header.write) {
@@ -172,11 +193,20 @@ public final class MappedFileRing implements AutoCloseable {
     }
 
     public Status closeWriter(Duration timeout) throws IOException, InterruptedException {
+        lifecycle.readLock().lock();
+        try {
+            currentMapping();
+            return closeWriterWhileOpen(timeout);
+        } finally {
+            lifecycle.readLock().unlock();
+        }
+    }
+
+    private Status closeWriterWhileOpen(Duration timeout) throws IOException, InterruptedException {
         long deadline = deadline(timeout);
         try (Guard guard = lockUntil(deadline)) {
             if (guard == null) return Status.TIMEOUT;
             MappedByteBuffer map = currentMapping();
-            map.load();
             if (readHeader(map) == null) return Status.INVALID_FRAME;
             map.putInt(WRITER_CLOSED, 1);
             map.force(WRITER_CLOSED, Integer.BYTES);
@@ -222,6 +252,9 @@ public final class MappedFileRing implements AutoCloseable {
                     : localLock.tryLock(remaining, TimeUnit.NANOSECONDS);
             if (!localAcquired) return null;
             try {
+                // This is cooperative interprocess serialization. Java does not define
+                // a mapped-buffer happens-before edge across JVMs; supported filesystems
+                // must provide coherent shared mappings and honor this native file lock.
                 FileLock lock = channel.tryLock(0, 1, false);
                 if (lock != null) return new Guard(lock, localLock);
             } catch (OverlappingFileLockException ignored) {
@@ -264,12 +297,23 @@ public final class MappedFileRing implements AutoCloseable {
     }
 
     @Override public void close() throws IOException {
-        MappedByteBuffer map = mapping;
-        if (map == null) return;
-        map.force();
-        mapping = null;
-        channel.close();
-        // Java 17 has no supported deterministic unmap API. On Windows the mapping may
-        // remain until the buffer cleaner runs; delete the session after this JVM exits.
+        lifecycle.writeLock().lock();
+        try {
+            MappedByteBuffer map = mapping;
+            if (map == null) return;
+            // File locks are held on behalf of the JVM. Serialize channel close against
+            // critical sections from every same-path ring in this JVM before closing.
+            localLock.lock();
+            try {
+                mapping = null;
+                channel.close();
+            } finally {
+                localLock.unlock();
+            }
+            // Java 17 has no supported deterministic unmap API; delete only after all
+            // participating JVMs have exited, especially on Windows.
+        } finally {
+            lifecycle.writeLock().unlock();
+        }
     }
 }
