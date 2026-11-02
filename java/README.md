@@ -41,7 +41,7 @@ On 2026-11-02, the original and mapped test suites passed in the Eclipse Temurin
 docker run --rm -v "$PWD":/src -w /src eclipse-temurin:17-jdk bash scripts/test.sh
 ```
 
-The passing output included the original two-process ring suite and `PASS mapped shared-file transfer across three JVMs and post-exit cleanup`. The host has no locally installed Java runtime. The earlier file-backed-only commit `9f320df` passed the existing hosted Ubuntu, macOS, and Windows workflow (run `41543791667`); that run does not validate the new mapped backend. The mapped implementation still needs a fresh hosted CI run on all three operating systems before platform support is claimed.
+The passing output included the original two-process ring suite and `PASS mapped shared-file transfer across three JVMs and post-exit cleanup`. The host has no locally installed Java runtime. GitHub Actions run `41546196988` passed the updated suite on `ubuntu-latest`, `macos-latest`, and `windows-latest` for mapped-backend commit `38e26f015c7dee316f037ef3fe977a71cf5ed581`. Earlier file-backed-only run `41543791667` covered commit `9f320df` and did not validate the mapped backend.
 
 ## Scope and limits
 
