@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.CountDownLatch;
@@ -82,55 +83,77 @@ public final class MappedMain {
     }
 
     private static void concurrentCloseTest(Path path) throws Exception {
-        MappedFileRing ring = MappedFileRing.create(path, 2, 16);
-        require(ring.send(bytes("one"), OP_TIMEOUT) == MappedFileRing.Status.OK, "close-race enqueue one failed");
-        require(ring.send(bytes("two"), OP_TIMEOUT) == MappedFileRing.Status.OK, "close-race enqueue two failed");
+        Path alias = path.resolveSibling("close-race-alias.mapped");
+        int payloadLength = 16 * 1024 * 1024;
+        MappedFileRing ring = MappedFileRing.create(path, 2, payloadLength);
+        Files.createLink(alias, path);
+        require(Files.isSameFile(path, alias), "hard-link test paths do not identify the same file");
+        MappedFileRing aliasRing = MappedFileRing.open(alias);
+        byte[] payload = new byte[payloadLength];
+        for (int i = 0; i < payload.length; i++) payload[i] = (byte) (i * 31);
         CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch closeStarted = new CountDownLatch(1);
+        CountDownLatch closeFinished = new CountDownLatch(1);
         AtomicReference<MappedFileRing.Status> result = new AtomicReference<>();
         AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicReference<Throwable> closeFailure = new AtomicReference<>();
         Thread sender = new Thread(() -> {
             started.countDown();
             try {
-                result.set(ring.send(bytes("blocked"), Duration.ofMillis(600)));
+                result.set(ring.send(payload, Duration.ofSeconds(5)));
             } catch (Throwable error) {
                 failure.set(error);
             }
-        }, "mapped-close-race-sender");
+        }, "mapped-alias-close-sender");
         sender.start();
         try {
-            require(started.await(2, TimeUnit.SECONDS), "close-race sender did not start");
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (sender.getState() != Thread.State.TIMED_WAITING && System.nanoTime() < deadline) {
+            require(started.await(2, TimeUnit.SECONDS), "alias-close sender did not start");
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+            while (!MappedFileRing.hasActiveFileLockSectionForTest() && System.nanoTime() < deadline) {
                 Thread.sleep(1);
             }
-            require(sender.getState() == Thread.State.TIMED_WAITING,
-                    "close-race sender did not enter its bounded full-ring wait");
-            long closeStart = System.nanoTime();
-            ring.close();
-            long closeElapsed = elapsedMillis(closeStart);
-            sender.join(1500);
-            require(!sender.isAlive(), "close-race sender did not finish after close waited");
-            require(failure.get() == null, "close interrupted an active operation: " + failure.get());
-            require(result.get() == MappedFileRing.Status.TIMEOUT, "active send did not finish with timeout");
-            require(closeElapsed >= 100 && closeElapsed < 2000,
-                    "close did not wait for the active send deadline: " + closeElapsed + " ms");
+            require(MappedFileRing.hasActiveFileLockSectionForTest(),
+                    "alias-close sender did not enter its file-lock critical section");
+            Thread closer = new Thread(() -> {
+                closeStarted.countDown();
+                try {
+                    aliasRing.close();
+                } catch (Throwable error) {
+                    closeFailure.set(error);
+                } finally {
+                    closeFinished.countDown();
+                }
+            }, "mapped-alias-close-closer");
+            closer.start();
+            require(closeStarted.await(2, TimeUnit.SECONDS), "alias closer did not start");
+            boolean returnedDuringCriticalSection = closeFinished.await(10, TimeUnit.MILLISECONDS) &&
+                    MappedFileRing.hasActiveFileLockSectionForTest();
+            require(!returnedDuringCriticalSection,
+                    "closing an alias returned while another handle held a FileLock");
+            sender.join(10000);
+            require(!sender.isAlive(), "alias-close sender exceeded its 10-second watchdog");
+            closer.join(5000);
+            require(!closer.isAlive(), "alias close did not finish after the operation");
+            require(closeFailure.get() == null, "alias close failed: " + closeFailure.get());
+            require(failure.get() == null, "alias close interrupted an active operation: " + failure.get());
+            require(result.get() == MappedFileRing.Status.OK, "active alias send did not complete");
+            MappedFileRing.Receive received = ring.receive(OP_TIMEOUT);
+            require(received.status == MappedFileRing.Status.OK && Arrays.equals(payload, received.payload),
+                    "message changed when an alias handle closed");
             boolean closedOperationRejected = false;
             try {
-                ring.send(bytes("after-close"), Duration.ZERO);
+                aliasRing.send(bytes("after-close"), Duration.ZERO);
             } catch (IOException expected) {
                 closedOperationRejected = expected.getMessage().contains("mapped session is closed");
             }
             require(closedOperationRejected, "operation after close was not rejected as closed");
-            System.out.println("PASS close waits for active operation and rejects later sends (" + closeElapsed + " ms)");
+            System.out.println("PASS alias close waited for active 16 MiB write and preserved payload");
         } finally {
             if (sender.isAlive()) {
-                ring.close();
+                sender.interrupt();
                 sender.join(1500);
-                if (sender.isAlive()) {
-                    sender.interrupt();
-                    sender.join(1500);
-                }
             }
+            aliasRing.close();
             ring.close();
         }
     }
@@ -222,10 +245,11 @@ public final class MappedMain {
             Process localTest = child("scenario", local.toString());
             children.add(localTest);
             String scenarioOutput = await("mapped scenario", localTest, Duration.ofSeconds(10));
-            require(scenarioOutput.contains("PASS close waits for active operation"),
+            require(scenarioOutput.contains("PASS alias close waited for active 16 MiB write"),
                     "mapped close-race regression did not report its pass");
             Files.delete(local); // subprocess exit proves its mapping lifetime has ended
             Files.delete(directory.resolve("close-race.mapped"));
+            Files.delete(directory.resolve("close-race-alias.mapped"));
 
             Path large = directory.resolve("large.mapped");
             Process largeTest = child("large-map", large.toString());
@@ -268,6 +292,10 @@ public final class MappedMain {
             Files.deleteIfExists(ready);
             Files.deleteIfExists(session);
             Files.deleteIfExists(local);
+            Files.deleteIfExists(directory.resolve("close-race.mapped"));
+            Files.deleteIfExists(directory.resolve("close-race-alias.mapped"));
+            Files.deleteIfExists(directory.resolve("large.mapped"));
+            Files.deleteIfExists(directory.resolve("lock.ready"));
             try { Files.deleteIfExists(directory); } catch (IOException ignored) { }
         }
     }

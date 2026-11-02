@@ -15,7 +15,6 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.EnumSet;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -39,25 +38,23 @@ public final class MappedFileRing implements AutoCloseable {
     private static final int WRITE_SEQUENCE = 16;
     private static final int READ_SEQUENCE = 24;
     private static final int WRITER_CLOSED = 32;
-    private static final ConcurrentHashMap<Path, ReentrantLock> LOCAL_LOCKS = new ConcurrentHashMap<>();
+    // JVM FileLocks are process-wide and may be addressed through path aliases.
+    // Serialize every mapped-ring file-lock critical section, but release this lock
+    // while waiting for capacity or a cross-process file lock.
+    private static final ReentrantLock PROCESS_FILE_LOCK = new ReentrantLock();
+    private static final ReentrantReadWriteLock PROCESS_LIFECYCLE = new ReentrantReadWriteLock(true);
 
-    private final Path path;
     private final FileChannel channel;
-    private final ReentrantLock localLock;
     private final int capacity;
     private final int maxPayload;
-    private final ReentrantReadWriteLock lifecycle = new ReentrantReadWriteLock(true);
     private MappedByteBuffer mapping;
 
-    private MappedFileRing(Path path, FileChannel channel, MappedByteBuffer mapping,
-                           int capacity, int maxPayload) {
-        this.path = path.toAbsolutePath().normalize();
+    private MappedFileRing(FileChannel channel, MappedByteBuffer mapping, int capacity, int maxPayload) {
         this.channel = channel;
         mapping.order(ByteOrder.LITTLE_ENDIAN);
         this.mapping = mapping;
         this.capacity = capacity;
         this.maxPayload = maxPayload;
-        this.localLock = LOCAL_LOCKS.computeIfAbsent(this.path, ignored -> new ReentrantLock());
     }
 
     public static MappedFileRing create(Path path, int capacity, int maxPayload) throws IOException {
@@ -80,9 +77,9 @@ public final class MappedFileRing implements AutoCloseable {
             mapping.putLong(WRITE_SEQUENCE, 0);
             mapping.putLong(READ_SEQUENCE, 0);
             mapping.putInt(WRITER_CLOSED, 0);
-            return new MappedFileRing(normalized, channel, mapping, capacity, maxPayload);
+            return new MappedFileRing(channel, mapping, capacity, maxPayload);
         } catch (IOException | RuntimeException error) {
-            channel.close();
+            closeChannelSafely(channel);
             Files.deleteIfExists(normalized);
             throw error;
         }
@@ -108,23 +105,34 @@ public final class MappedFileRing implements AutoCloseable {
                     maxPayload < 1 || expectedBytes != byteCount) {
                 throw new IOException("invalid mapped-ring header, layout, or version");
             }
-            return new MappedFileRing(normalized, channel, mapping, capacity, maxPayload);
+            return new MappedFileRing(channel, mapping, capacity, maxPayload);
         } catch (IOException | RuntimeException error) {
-            channel.close();
+            closeChannelSafely(channel);
             throw error;
+        }
+    }
+
+    private static void closeChannelSafely(FileChannel channel) throws IOException {
+        PROCESS_LIFECYCLE.writeLock().lock();
+        try {
+            channel.close();
+        } finally {
+            PROCESS_LIFECYCLE.writeLock().unlock();
         }
     }
 
     public int capacity() { return capacity; }
     public int maxPayloadBytes() { return maxPayload; }
 
+    static boolean hasActiveFileLockSectionForTest() { return PROCESS_FILE_LOCK.isLocked(); }
+
     public Status send(byte[] payload, Duration timeout) throws IOException, InterruptedException {
-        lifecycle.readLock().lock();
+        PROCESS_LIFECYCLE.readLock().lock();
         try {
             currentMapping();
             return sendWhileOpen(payload, timeout);
         } finally {
-            lifecycle.readLock().unlock();
+            PROCESS_LIFECYCLE.readLock().unlock();
         }
     }
 
@@ -154,12 +162,12 @@ public final class MappedFileRing implements AutoCloseable {
     }
 
     public Receive receive(Duration timeout) throws IOException, InterruptedException {
-        lifecycle.readLock().lock();
+        PROCESS_LIFECYCLE.readLock().lock();
         try {
             currentMapping();
             return receiveWhileOpen(timeout);
         } finally {
-            lifecycle.readLock().unlock();
+            PROCESS_LIFECYCLE.readLock().unlock();
         }
     }
 
@@ -189,12 +197,12 @@ public final class MappedFileRing implements AutoCloseable {
     }
 
     public Status closeWriter(Duration timeout) throws IOException, InterruptedException {
-        lifecycle.readLock().lock();
+        PROCESS_LIFECYCLE.readLock().lock();
         try {
             currentMapping();
             return closeWriterWhileOpen(timeout);
         } finally {
-            lifecycle.readLock().unlock();
+            PROCESS_LIFECYCLE.readLock().unlock();
         }
     }
 
@@ -243,22 +251,23 @@ public final class MappedFileRing implements AutoCloseable {
         while (true) {
             long remaining = deadline - System.nanoTime();
             boolean localAcquired = remaining <= 0
-                    ? localLock.tryLock()
-                    : localLock.tryLock(remaining, TimeUnit.NANOSECONDS);
+                    ? PROCESS_FILE_LOCK.tryLock()
+                    : PROCESS_FILE_LOCK.tryLock(remaining, TimeUnit.NANOSECONDS);
             if (!localAcquired) return null;
             try {
                 // This is cooperative interprocess serialization. Java does not define
                 // a mapped-buffer happens-before edge across JVMs; supported filesystems
                 // must provide coherent shared mappings and honor this native file lock.
                 FileLock lock = channel.tryLock(0, 1, false);
-                if (lock != null) return new Guard(lock, localLock);
+                if (lock != null) return new Guard(lock, PROCESS_FILE_LOCK);
             } catch (OverlappingFileLockException ignored) {
-                // Serialize channels in one JVM with localLock; this covers unrelated aliases too.
+                // MappedFileRing peers use PROCESS_FILE_LOCK, independent of path aliases.
+                // An external same-JVM channel may still hold an overlapping FileLock.
             } catch (IOException | RuntimeException error) {
-                localLock.unlock();
+                PROCESS_FILE_LOCK.unlock();
                 throw error;
             }
-            localLock.unlock();
+            PROCESS_FILE_LOCK.unlock();
             if (!pauseUntil(deadline)) return null;
         }
     }
@@ -281,34 +290,30 @@ public final class MappedFileRing implements AutoCloseable {
 
     private static final class Guard implements AutoCloseable {
         private final FileLock fileLock;
-        private final ReentrantLock localLock;
-        private Guard(FileLock fileLock, ReentrantLock localLock) {
+        private final ReentrantLock processLock;
+        private Guard(FileLock fileLock, ReentrantLock processLock) {
             this.fileLock = fileLock;
-            this.localLock = localLock;
+            this.processLock = processLock;
         }
         @Override public void close() throws IOException {
-            try { fileLock.release(); } finally { localLock.unlock(); }
+            try { fileLock.release(); } finally { processLock.unlock(); }
         }
     }
 
     @Override public void close() throws IOException {
-        lifecycle.writeLock().lock();
+        PROCESS_LIFECYCLE.writeLock().lock();
         try {
             MappedByteBuffer map = mapping;
             if (map == null) return;
-            // File locks are held on behalf of the JVM. Serialize channel close against
-            // critical sections from every same-path ring in this JVM before closing.
-            localLock.lock();
-            try {
-                mapping = null;
-                channel.close();
-            } finally {
-                localLock.unlock();
-            }
+            // File locks are held on behalf of the JVM. The process-wide lifecycle
+            // write lock ensures no MappedFileRing operation, including through an
+            // alias path, can hold a lock while this channel closes.
+            channel.close();
+            mapping = null;
             // Java 17 has no supported deterministic unmap API; delete only after all
             // participating JVMs have exited, especially on Windows.
         } finally {
-            lifecycle.writeLock().unlock();
+            PROCESS_LIFECYCLE.writeLock().unlock();
         }
     }
 }
