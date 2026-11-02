@@ -80,7 +80,6 @@ public final class MappedFileRing implements AutoCloseable {
             mapping.putLong(WRITE_SEQUENCE, 0);
             mapping.putLong(READ_SEQUENCE, 0);
             mapping.putInt(WRITER_CLOSED, 0);
-            mapping.force(0, HEADER_BYTES);
             return new MappedFileRing(normalized, channel, mapping, capacity, maxPayload);
         } catch (IOException | RuntimeException error) {
             channel.close();
@@ -146,9 +145,7 @@ public final class MappedFileRing implements AutoCloseable {
                     int offset = HEADER_BYTES + slot * stride;
                     map.putInt(offset, payload.length);
                     for (int i = 0; i < payload.length; i++) map.put(offset + Integer.BYTES + i, payload[i]);
-                    map.force(offset, Integer.BYTES + payload.length);
                     map.putLong(WRITE_SEQUENCE, header.write + 1);
-                    map.force(WRITE_SEQUENCE, Long.BYTES);
                     return Status.OK;
                 }
             }
@@ -183,7 +180,6 @@ public final class MappedFileRing implements AutoCloseable {
                     byte[] payload = new byte[length];
                     for (int i = 0; i < length; i++) payload[i] = map.get(offset + Integer.BYTES + i);
                     map.putLong(READ_SEQUENCE, header.read + 1);
-                    map.force(READ_SEQUENCE, Long.BYTES);
                     return new Receive(Status.OK, payload);
                 }
                 if (header.closed) return new Receive(Status.END_OF_STREAM, new byte[0]);
@@ -209,7 +205,6 @@ public final class MappedFileRing implements AutoCloseable {
             MappedByteBuffer map = currentMapping();
             if (readHeader(map) == null) return Status.INVALID_FRAME;
             map.putInt(WRITER_CLOSED, 1);
-            map.force(WRITER_CLOSED, Integer.BYTES);
             return Status.OK;
         }
     }
