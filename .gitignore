@@ -1,0 +1,7 @@
+/build/
+/build-*/
+/cmake-build-*/
+/benchmark-results/
+/showcase-data/
+*.csv
+.DS_Store
