@@ -5,7 +5,7 @@ This Java 17 branch now contains two independent file-backed SPSC implementation
 - `FileRing` is the initial positional-I/O prototype. It reads and writes slots through `FileChannel` while holding a byte-range `FileLock`.
 - `MappedFileRing` maps the session file with `FileChannel.map(READ_WRITE)` and copies bounded messages into fixed-size mapped slots. A byte-range `FileLock` serializes each operation across JVMs; a process-local `ReentrantLock` serializes channels within one JVM. It does not page in or force the full mapping on each operation. Empty/full waits poll with a 1 ms interval and obey the caller's deadline.
 
-The mapped implementation has its own 64-byte little-endian header (`JMR1`, version 1), fixed slot sizes, monotonically increasing read/write sequences, and writer-closed flag. It supports one producer and one consumer. It is a correctness-first mapped-file backend: it still copies payloads, serializes operations with OS file locks, and forces updates. No zero-copy or latency claim is made.
+The mapped implementation has its own 64-byte little-endian header (`JMR1`, version 1), fixed slot sizes, monotonically increasing read/write sequences, and writer-closed flag. It supports one producer and one consumer. It is a correctness-first mapped-file backend: it still copies payloads and serializes operations with OS file locks. It does not force transient IPC writes to durable storage. No zero-copy or latency claim is made.
 
 ## Build and test
 
