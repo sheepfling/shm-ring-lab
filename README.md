@@ -129,11 +129,11 @@ build\windows-msvc-x64\Release\shm_ring_demo.exe cleanup showcase
 
 | Platform | Backend in the project | Verification status |
 | --- | --- | --- |
-| macOS | POSIX shared memory and named semaphore | On 2026-11-02, the native Apple Silicon build passed all 9 process-level correctness scenarios with Apple Clang 21.0.0 and CMake 4.4.4. The earlier 2026-10-11 three-run result covered 8 scenarios. |
-| Linux | POSIX shared memory and named semaphore | On 2026-11-02, the Docker proof passed in Debian 12 (Bookworm) on LinuxKit 7.0.12 / aarch64, with GCC 12.2.0 and CMake 3.25.1: all 9 current CTest scenarios passed 3 times, then 5,000 separate-process messages passed count, byte, and SHA-256 checks. This remains container evidence, not a native Linux host run. |
-| Windows | Win32 file mapping and named mutex | CMake MSVC x64 preset, PB-MSI checklist, and a GitHub Actions Windows job are present. No result from the new hosted Windows job is recorded yet; the native checklist remains outstanding. |
+| macOS | POSIX shared memory and named semaphore | On 2026-11-02, the native Apple Silicon build passed all 9 process-level correctness scenarios with Apple Clang 21.0.0 and CMake 4.4.4. The GitHub Actions macOS runner also passed. The earlier 2026-10-11 three-run result covered 8 scenarios. |
+| Linux | POSIX shared memory and named semaphore | On 2026-11-02, GitHub Actions Ubuntu passed the native-host build and all 9 CTest scenarios. The separate Docker proof passed in Debian 12 (Bookworm) on LinuxKit 7.0.12 / aarch64, with GCC 12.2.0 and CMake 3.25.1: all 9 current CTest scenarios passed 3 times, then 5,000 separate-process messages passed count, byte, and SHA-256 checks. |
+| Windows | Win32 file mapping and named mutex | On 2026-11-02, the hosted Windows Server 2025 runner passed CMake build and all 9 CTest scenarios using Visual Studio 2026 / MSVC 19.51.36260.0. The PB-MSI same-session and cross-session checklist remains outstanding. |
 
-The Docker run proves the Linux aarch64 container route; it does not replace a native Linux host run. The new GitHub Actions matrix will add hosted Windows and macOS results when it completes; Windows still needs the detailed PB-MSI session-identity run. See [the verification backlog](docs/verification-backlog.md) for the remaining checks.
+The GitHub Actions Ubuntu job is native Linux-host evidence; Docker provides a separate Linux/aarch64 container run. Hosted Windows CI verifies the build and process scenarios, while the detailed PB-MSI session-identity run remains outstanding. See [the verification backlog](docs/verification-backlog.md) for the remaining checks.
 
 ## How it works
 
