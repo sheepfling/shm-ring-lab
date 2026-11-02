@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -86,7 +87,8 @@ std::wstring quote_argument(const std::wstring& arg) {
 class Child {
 public:
     Child(const std::string& executable, const std::vector<std::string>& args,
-          bool watchdog_group = false, const std::filesystem::path& stdin_file = {}) {
+          bool watchdog_group = false, const std::filesystem::path& stdin_file = {},
+          bool open_stdin_pipe = false) {
         if (watchdog_group) {
             job_ = ::CreateJobObjectW(nullptr, nullptr);
             if (job_ == nullptr) throw std::runtime_error("CreateJobObjectW failed");
@@ -107,9 +109,29 @@ public:
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         HANDLE input_handle = INVALID_HANDLE_VALUE;
+        HANDLE stdin_pipe_write = INVALID_HANDLE_VALUE;
         HANDLE null_handle = INVALID_HANDLE_VALUE;
         BOOL inherit_handles = FALSE;
-        if (!stdin_file.empty()) {
+        if (open_stdin_pipe) {
+            SECURITY_ATTRIBUTES attributes{};
+            attributes.nLength = sizeof(attributes);
+            attributes.bInheritHandle = TRUE;
+            if (!::CreatePipe(&input_handle, &stdin_pipe_write, &attributes, 0)) {
+                const auto error = ::GetLastError();
+                if (job_ != nullptr) ::CloseHandle(job_);
+                job_ = nullptr;
+                throw std::runtime_error("CreatePipe(stdin) failed (" + std::to_string(error) + ")");
+            }
+            if (!::SetHandleInformation(stdin_pipe_write, HANDLE_FLAG_INHERIT, 0)) {
+                const auto error = ::GetLastError();
+                ::CloseHandle(input_handle);
+                ::CloseHandle(stdin_pipe_write);
+                if (job_ != nullptr) ::CloseHandle(job_);
+                job_ = nullptr;
+                throw std::runtime_error("SetHandleInformation(stdin pipe) failed (" +
+                                         std::to_string(error) + ")");
+            }
+        } else if (!stdin_file.empty()) {
             SECURITY_ATTRIBUTES attributes{};
             attributes.nLength = sizeof(attributes);
             attributes.bInheritHandle = TRUE;
@@ -122,12 +144,18 @@ public:
                 job_ = nullptr;
                 throw std::runtime_error("CreateFileW(stdin) failed (" + std::to_string(error) + ")");
             }
+        }
+        if (!stdin_file.empty() || open_stdin_pipe) {
+            SECURITY_ATTRIBUTES attributes{};
+            attributes.nLength = sizeof(attributes);
+            attributes.bInheritHandle = TRUE;
             null_handle = ::CreateFileW(L"NUL", GENERIC_WRITE,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes,
                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (null_handle == INVALID_HANDLE_VALUE) {
                 const auto error = ::GetLastError();
-                ::CloseHandle(input_handle);
+                if (input_handle != INVALID_HANDLE_VALUE) ::CloseHandle(input_handle);
+                if (stdin_pipe_write != INVALID_HANDLE_VALUE) ::CloseHandle(stdin_pipe_write);
                 if (job_ != nullptr) ::CloseHandle(job_);
                 job_ = nullptr;
                 throw std::runtime_error("CreateFileW(NUL) failed (" + std::to_string(error) + ")");
@@ -137,6 +165,7 @@ public:
             startup.hStdOutput = null_handle;
             startup.hStdError = null_handle;
             inherit_handles = TRUE;
+            stdin_write_ = stdin_pipe_write;
         }
         const DWORD flags = CREATE_NO_WINDOW | (job_ != nullptr ? CREATE_SUSPENDED : 0U);
         const BOOL created = ::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr,
@@ -146,6 +175,8 @@ public:
         if (input_handle != INVALID_HANDLE_VALUE) ::CloseHandle(input_handle);
         if (null_handle != INVALID_HANDLE_VALUE) ::CloseHandle(null_handle);
         if (!created) {
+            if (stdin_write_ != INVALID_HANDLE_VALUE) ::CloseHandle(stdin_write_);
+            stdin_write_ = INVALID_HANDLE_VALUE;
             if (job_ != nullptr) ::CloseHandle(job_);
             job_ = nullptr;
             throw std::runtime_error("CreateProcessW failed (" + std::to_string(create_error) + ")");
@@ -157,6 +188,7 @@ public:
                 (void)::WaitForSingleObject(process_.hProcess, 5000);
                 ::CloseHandle(process_.hThread);
                 ::CloseHandle(process_.hProcess);
+                close_stdin();
                 ::CloseHandle(job_);
                 process_ = {};
                 job_ = nullptr;
@@ -168,6 +200,7 @@ public:
                 (void)::WaitForSingleObject(process_.hProcess, 5000);
                 ::CloseHandle(process_.hThread);
                 ::CloseHandle(process_.hProcess);
+                close_stdin();
                 ::CloseHandle(job_);
                 process_ = {};
                 job_ = nullptr;
@@ -179,7 +212,7 @@ public:
     }
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
-    ~Child() { terminate(); close_handles(); }
+    ~Child() { terminate(); close_stdin(); close_handles(); }
 
     bool wait_for(std::chrono::milliseconds timeout, int& exit_code) {
         const auto value = ::WaitForSingleObject(process_.hProcess, static_cast<DWORD>(timeout.count()));
@@ -199,6 +232,10 @@ public:
             finished_ = true;
         }
     }
+    void close_stdin() noexcept {
+        if (stdin_write_ != INVALID_HANDLE_VALUE) ::CloseHandle(stdin_write_);
+        stdin_write_ = INVALID_HANDLE_VALUE;
+    }
 
 private:
     void close_handles() noexcept {
@@ -209,6 +246,7 @@ private:
     }
     PROCESS_INFORMATION process_{};
     HANDLE job_ = nullptr;
+    HANDLE stdin_write_ = INVALID_HANDLE_VALUE;
     bool finished_ = false;
 };
 
@@ -217,19 +255,36 @@ private:
 class Child {
 public:
     Child(const std::string& executable, const std::vector<std::string>& args,
-          bool watchdog_group = false, const std::filesystem::path& stdin_file = {})
+          bool watchdog_group = false, const std::filesystem::path& stdin_file = {},
+          bool open_stdin_pipe = false)
         : watchdog_group_(watchdog_group) {
+        int stdin_pipe[2] = {-1, -1};
+        if (open_stdin_pipe && ::pipe(stdin_pipe) != 0) {
+            throw std::runtime_error("pipe(stdin) failed");
+        }
         pid_ = ::fork();
-        if (pid_ < 0) throw std::runtime_error("fork failed");
+        if (pid_ < 0) {
+            if (stdin_pipe[0] >= 0) ::close(stdin_pipe[0]);
+            if (stdin_pipe[1] >= 0) ::close(stdin_pipe[1]);
+            throw std::runtime_error("fork failed");
+        }
         if (pid_ == 0) {
             if (watchdog_group_) (void)::setpgid(0, 0);
-            if (!stdin_file.empty()) {
+            if (open_stdin_pipe) {
+                (void)::close(stdin_pipe[1]);
+                if (stdin_pipe[0] != STDIN_FILENO && ::dup2(stdin_pipe[0], STDIN_FILENO) < 0) {
+                    ::_exit(126);
+                }
+                if (stdin_pipe[0] != STDIN_FILENO) (void)::close(stdin_pipe[0]);
+            } else if (!stdin_file.empty()) {
                 const int input = ::open(stdin_file.c_str(), O_RDONLY);
                 if (input < 0) ::_exit(126);
                 if (input != STDIN_FILENO) {
                     if (::dup2(input, STDIN_FILENO) < 0) ::_exit(126);
                     (void)::close(input);
                 }
+            }
+            if (open_stdin_pipe || !stdin_file.empty()) {
                 const int null_output = ::open("/dev/null", O_WRONLY);
                 if (null_output < 0) ::_exit(126);
                 if ((null_output != STDOUT_FILENO &&
@@ -253,11 +308,15 @@ public:
             ::execv(executable.c_str(), argv.data());
             ::_exit(127);
         }
+        if (open_stdin_pipe) {
+            (void)::close(stdin_pipe[0]);
+            stdin_write_ = stdin_pipe[1];
+        }
         if (watchdog_group_) (void)::setpgid(pid_, pid_);
     }
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
-    ~Child() { terminate(); }
+    ~Child() { terminate(); close_stdin(); }
 
     bool wait_for(std::chrono::milliseconds timeout, int& exit_code) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -294,9 +353,14 @@ public:
             finished_ = true;
         }
     }
+    void close_stdin() noexcept {
+        if (stdin_write_ >= 0) ::close(stdin_write_);
+        stdin_write_ = -1;
+    }
 
 private:
     pid_t pid_ = -1;
+    int stdin_write_ = -1;
     bool finished_ = false;
     bool watchdog_group_ = false;
 };
@@ -633,7 +697,7 @@ void test_duplex_directional_channels(const std::string& peer) {
     expect(Session::remove(b_to_a), "cleanup of B-to-A direction failed");
 }
 
-void test_duplex_cli_teardown(const std::string&, const std::string& demo) {
+void test_duplex_cli_teardown(const std::string& peer, const std::string& demo) {
     const auto failed_outgoing = unique_name();
     const auto failed_incoming = unique_name();
     const auto failed_input = std::filesystem::temp_directory_path() /
@@ -660,6 +724,42 @@ void test_duplex_cli_teardown(const std::string&, const std::string& demo) {
         std::filesystem::remove(failed_input);
         (void)Session::remove(failed_outgoing);
         (void)Session::remove(failed_incoming);
+        throw;
+    }
+
+    const auto invalid_outgoing = unique_name();
+    const auto invalid_incoming = unique_name();
+    const auto duplex_ready = marker_path(invalid_outgoing);
+    std::filesystem::remove(duplex_ready);
+    try {
+        {
+            auto outgoing = Session::create(invalid_outgoing, {2, 16});
+            auto incoming = Session::create(invalid_incoming, {2, 16});
+            expect(outgoing.claim_reader() == Status::ok,
+                   "could not claim outgoing reader for receive-error test");
+            Child failing(demo, {"duplex", invalid_outgoing, invalid_incoming, duplex_ready.string()},
+                          false, {}, true);
+            wait_marker(duplex_ready);
+            Child corrupter(peer, {"corrupt-frame", invalid_incoming});
+            wait_success(corrupter, 3s, "invalid incoming-frame injector");
+
+            const auto start = std::chrono::steady_clock::now();
+            int exit_code = -1;
+            expect(failing.wait_for(3s, exit_code),
+                   "duplex CLI stayed blocked on idle open stdin after an incoming receive failure");
+            expect(std::chrono::steady_clock::now() - start < 3s,
+                   "duplex receive-error teardown exceeded its 3-second bound");
+            expect(exit_code != 0, "duplex CLI returned success after an incoming receive failure");
+            expect(outgoing.receive(100ms).status == Status::closed,
+                   "duplex receive failure did not close the outgoing writer");
+        }
+        std::filesystem::remove(duplex_ready);
+        expect(Session::remove(invalid_outgoing), "cleanup of receive-error outgoing session failed");
+        expect(Session::remove(invalid_incoming), "cleanup of receive-error incoming session failed");
+    } catch (...) {
+        std::filesystem::remove(duplex_ready);
+        (void)Session::remove(invalid_outgoing);
+        (void)Session::remove(invalid_incoming);
         throw;
     }
 

@@ -18,7 +18,7 @@ cmake --build --preset windows-msvc-x64-release --parallel
 ctest --preset windows-msvc-x64-release
 ```
 
-The current CTest executable runs nine bounded process scenarios: FIFO ordering/wraparound/shutdown, empty receive timeout, full-ring backpressure and idle peer exit, a process killed while holding the mutex, creator/opener initialization, duplicate role ownership, malformed protocol/frame checks, two directional rings, and duplex CLI error teardown under idle and sustained inbound traffic. On Windows, the dead-owner case must observe `WAIT_ABANDONED`, fail the old session, and use a fresh name; it does not repair a partially written frame.
+The current CTest executable runs nine bounded process scenarios: FIFO ordering/wraparound/shutdown, empty receive timeout, full-ring backpressure and idle peer exit, a process killed while holding the mutex, creator/opener initialization, duplicate role ownership, malformed protocol/frame checks, two directional rings, and duplex CLI teardown for outbound send errors, idle/flood input, and incoming receive failure while stdin remains open. On Windows, the dead-owner case must observe `WAIT_ABANDONED`, fail the old session, and use a fresh name; it does not repair a partially written frame.
 
 ## Separate-process message proof
 

@@ -3,7 +3,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <condition_variable>
+#include <deque>
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -28,7 +33,7 @@ void usage() {
         "  shm_ring_demo host <name> [capacity] [max-payload-bytes]\n"
         "  shm_ring_demo produce <name>\n"
         "  shm_ring_demo consume <name>\n"
-        "  shm_ring_demo duplex <outgoing-name> <incoming-name>\n"
+        "  shm_ring_demo duplex <outgoing-name> <incoming-name> [ready-file]\n"
         "  shm_ring_demo cleanup <name>\n"
         "Producer reads stdin lines and closes its writer at EOF. Consumer drains\n"
         "messages and exits after the writer closes. Duplex runs one reader thread\n"
@@ -72,24 +77,56 @@ int consume(const std::string& name) {
     }
 }
 
-int duplex(const std::string& outgoing_name, const std::string& incoming_name) {
+struct InputState {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::string> lines;
+    bool eof = false;
+    bool stop = false;
+};
+
+int duplex(const std::string& outgoing_name, const std::string& incoming_name,
+           const std::string& ready_file = {}) {
     auto outgoing = Session::open(outgoing_name);
     auto incoming = Session::open(incoming_name);
     require_ok(outgoing.claim_writer(), "claim outgoing writer");
     require_ok(incoming.claim_reader(), "claim incoming reader");
 
     std::atomic<bool> reader_failed{false};
+    std::atomic<bool> stop_reader{false};
+    auto input = std::make_shared<InputState>();
+    std::thread input_reader([input] {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            std::unique_lock<std::mutex> lock(input->mutex);
+            input->ready.wait(lock, [&] { return input->lines.size() < 64 || input->stop; });
+            if (input->stop) break;
+            input->lines.push_back(std::move(line));
+            lock.unlock();
+            input->ready.notify_one();
+        }
+        {
+            std::lock_guard<std::mutex> guard(input->mutex);
+            input->eof = true;
+        }
+        input->ready.notify_all();
+    });
     std::mutex output_mutex;
-    std::thread reader([&] {
+    std::thread reader([&, input] {
         for (;;) {
-            if (reader_failed.load()) return;
-            auto result = incoming.receive(1s);
+            if (stop_reader.load()) return;
+            auto result = incoming.receive(100ms);
             if (result.status == Status::timeout) {
                 continue;
             }
             if (result.status == Status::closed) return;
             if (result.status != Status::ok) {
                 reader_failed.store(true);
+                {
+                    std::lock_guard<std::mutex> guard(input->mutex);
+                    input->stop = true;
+                }
+                input->ready.notify_all();
                 return;
             }
             std::lock_guard<std::mutex> guard(output_mutex);
@@ -100,18 +137,70 @@ int duplex(const std::string& outgoing_name, const std::string& incoming_name) {
         }
     });
 
-    std::string line;
-    while (!reader_failed.load() && std::getline(std::cin, line)) {
-        const auto status = outgoing.send(line.data(), line.size(), 5s);
-        if (status != Status::ok) {
+    if (!ready_file.empty()) {
+        std::ofstream ready(ready_file, std::ios::binary | std::ios::trunc);
+        ready << "ready\n";
+        ready.flush();
+        if (!ready) {
             reader_failed.store(true);
-            break;
+            {
+                std::lock_guard<std::mutex> guard(input->mutex);
+                input->stop = true;
+            }
+            input->ready.notify_all();
         }
     }
+
+    bool input_eof = false;
+    while (!reader_failed.load()) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lock(input->mutex);
+            input->ready.wait_for(lock, 50ms, [&] {
+                return !input->lines.empty() || input->eof || reader_failed.load();
+            });
+            if (reader_failed.load()) break;
+            if (input->lines.empty()) {
+                if (input->eof) {
+                    input_eof = true;
+                    break;
+                }
+                continue;
+            }
+            line = std::move(input->lines.front());
+            input->lines.pop_front();
+            input->ready.notify_one();
+        }
+        if (outgoing.send(line.data(), line.size(), 5s) != Status::ok) {
+            reader_failed.store(true);
+            {
+                std::lock_guard<std::mutex> guard(input->mutex);
+                input->stop = true;
+            }
+            input->ready.notify_all();
+        }
+    }
+
     const auto close_status = outgoing.close_writer();
+    stop_reader.store(true);
+    if (!input_eof) {
+        std::lock_guard<std::mutex> guard(input->mutex);
+        input->stop = true;
+    }
+    input->ready.notify_all();
     reader.join();
-    require_ok(close_status, "close outgoing writer");
-    if (reader_failed.load()) throw std::runtime_error("duplex receive/send failed");
+    if (input_eof) {
+        input_reader.join();
+    } else {
+        // C++ has no portable way to cancel a thread blocked in getline. On a
+        // fatal duplex error, let process exit close stdin and its OS handles.
+        input_reader.detach();
+    }
+    if (close_status != Status::ok || reader_failed.load()) {
+        std::cerr << "duplex receive/send failed; outgoing writer closed\n" << std::flush;
+        if (!input_eof) std::_Exit(1);
+        throw std::runtime_error("duplex receive/send failed");
+    }
     return 0;
 }
 
@@ -143,7 +232,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string(argv[1]) == "produce") return produce(argv[2]);
         if (argc == 3 && std::string(argv[1]) == "consume") return consume(argv[2]);
-        if (argc == 4 && std::string(argv[1]) == "duplex") return duplex(argv[2], argv[3]);
+        if ((argc == 4 || argc == 5) && std::string(argv[1]) == "duplex") {
+            return duplex(argv[2], argv[3], argc == 5 ? argv[4] : "");
+        }
         if (argc == 3 && std::string(argv[1]) == "cleanup") {
             if (!Session::remove(argv[2])) throw std::runtime_error("session cleanup failed");
             return 0;
