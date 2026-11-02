@@ -145,12 +145,13 @@ public final class Main {
     private static Process child(String... args) throws Exception {
         String javaName = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
         Path java = Path.of(System.getProperty("java.home"), "bin", javaName);
-        String[] command = new String[4 + args.length];
+        String[] command = new String[5 + args.length];
         command[0] = java.toString();
-        command[1] = "-cp";
-        command[2] = System.getProperty("java.class.path");
-        command[3] = Main.class.getName();
-        System.arraycopy(args, 0, command, 4, args.length);
+        command[1] = "-XX:-UsePerfData";
+        command[2] = "-cp";
+        command[3] = System.getProperty("java.class.path");
+        command[4] = Main.class.getName();
+        System.arraycopy(args, 0, command, 5, args.length);
         return new ProcessBuilder(command).redirectErrorStream(true).start();
     }
 

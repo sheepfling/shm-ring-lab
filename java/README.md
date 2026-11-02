@@ -1,50 +1,52 @@
-# Java file-backed SPSC ring prototype
+# Java SPSC process-ring prototype
 
-This issue branch starts an independent Java 17 implementation of the lab's bounded SPSC process-message API. It uses a versioned file layout and `FileChannel` positional I/O with an exclusive byte-range `FileLock`; it does not use JNI/JNA or the C++ POSIX/Win32 session format. Peers must use the same file path and this Java implementation. Session files are transient IPC state, not durable storage.
+This Java 17 branch now contains two independent file-backed SPSC implementations:
 
-Messages are copied into fixed-size slots. The API includes FIFO ordering, wraparound, full/empty deadlines, a one-way writer close, and a pointer-free fixed-width header. Every operation takes the file lock and checks the header before touching slots. This is a correctness-first file-backed IPC prototype, not an mmap/zero-copy backend.
+- `FileRing` is the initial positional-I/O prototype. It reads and writes slots through `FileChannel` while holding a byte-range `FileLock`.
+- `MappedFileRing` maps the session file with `FileChannel.map(READ_WRITE)` and copies bounded messages into fixed-size mapped slots. A byte-range `FileLock` serializes each operation across JVMs; a process-local `ReentrantLock` serializes channels within one JVM. Payload bytes and sequence/header updates are explicitly forced before the operation reports success. Empty/full waits poll with a 1 ms interval and obey the caller's deadline.
 
-## Run
+The mapped implementation has its own 64-byte little-endian header (`JMR1`, version 1), fixed slot sizes, monotonically increasing read/write sequences, and writer-closed flag. It supports one producer and one consumer. It is a correctness-first mapped-file backend: it still copies payloads, serializes operations with OS file locks, and forces updates. No zero-copy or latency claim is made.
 
-Requires a JDK 17 or newer:
+## Build and test
+
+Requires JDK 17 or newer:
 
 ```sh
 bash scripts/test.sh
 ```
 
-The test creates a capacity-two ring to check full timeout, FIFO wraparound, and clean close, then transfers 500 messages between separately launched producer and consumer JVMs under a 15-second process deadline.
+The script compiles with `javac --release 17 -Xlint:all -Werror`, runs the original `FileRing` tests, then runs `MappedFileRing` tests. The mapped tests cover FIFO/wraparound, full and empty deadlines, invalid/oversized payloads, writer close/end-of-stream, cross-process file-lock contention, a 500-message transfer between separate producer and consumer JVMs, and cleanup after all mapped-file users exit. Each child has a bounded wait and is forcibly terminated on timeout.
 
-For a manual exchange, first create a ring and leave its host process running:
-
-```sh
-java -cp build/classes lab.shmring.Main host /tmp/demo.ring 16 256
-```
-
-In two other terminals run:
+The mapped test harness can also be run by itself after compilation:
 
 ```sh
-java -cp build/classes lab.shmring.Main consume /tmp/demo.ring 500
-java -cp build/classes lab.shmring.Main produce /tmp/demo.ring 500
+java -cp build/classes lab.shmring.MappedMain selftest
 ```
 
-Run the consumer before the producer. Press Enter in the host terminal after both
-peers exit, then remove the session file. Remove session files only after all
-peers have closed them.
+## IPC and lifecycle contract
 
-## Limits
+These sessions are ordinary same-host files opened by path and memory-mapped by Java. They are not POSIX `shm_open` objects or Windows named `CreateFileMapping` objects; they do not establish a common namespace or permissions model with the C++ implementation. The `JMR1` layout and locking protocol are Java-specific and are not C++ wire/ABI compatible.
 
-- This prototype is not wire-compatible with the C++ transport and does not claim shared-memory mapping performance.
-- Use one producer and one consumer. A local JVM lock handles overlapping `FileLock` attempts between channels in the same JVM; the OS file lock coordinates processes.
-- A process crash releases its OS file lock, but a crash during an operation can leave partially updated state. Treat abnormal peer exit as a failed session and recreate a fresh file; no owner-death recovery is claimed.
-- Run the correctness harness on Linux, macOS, and Windows before declaring support. CI coverage is included as a separate check, not as a replacement for review of the file-lock semantics.
+Create the file once with `MappedFileRing.create`, wait until initialization completes, then have the peer open that same path with `MappedFileRing.open`. The creator owns session naming and eventual deletion. Delete only after every peer has closed the session and exited. Java 17 has no supported portable deterministic unmap API; closing a ring closes its channel and drops its map reference, but on Windows the OS mapping may remain until garbage collection/process exit. The test deletes files only after the hosting JVMs have exited.
 
-## Initial test evidence
+The OS file lock is the interprocess serialization primitive. The implementation does not use shared `Atomic*`, `synchronized`, or `ReentrantLock` objects as cross-process synchronization. Each lock acquisition is bounded by the operation deadline. `MappedByteBuffer.force()` is used to publish slot bytes before advancing the write sequence and to persist sequence/header changes; this is not a transaction or crash-recovery guarantee. If a process dies during an operation, discard the session and create a fresh file. No abandoned-operation repair is claimed.
 
-On 2026-11-02, `bash scripts/test.sh` passed in an official Eclipse Temurin
-17.0.20.1 JDK container on LinuxKit 7.0.12 / aarch64. The test covered FIFO,
-wraparound, full and empty deadlines, cross-process file-lock contention,
-writer close, and a 500-message producer/consumer transfer between separate
-JVMs. The same bounded test passed in GitHub Actions on `ubuntu-latest`,
-`macos-latest`, and `windows-latest` for commit `9f320df` (run
-41543791667). These are hosted OS results; this Mac has no locally installed
-Java runtime.
+Files created on POSIX hosts request owner read/write permissions (`0600`). On platforms without POSIX file attributes, the file uses the platform's inherited default ACL. Choose a private directory with appropriate access control. Treat these session files as transient IPC state, not durable storage.
+
+## Verification evidence
+
+On 2026-11-02, the original and mapped test suites passed in the Eclipse Temurin 17 container on LinuxKit/aarch64 with:
+
+```sh
+docker run --rm -v "$PWD":/src -w /src eclipse-temurin:17-jdk bash scripts/test.sh
+```
+
+The passing output included the original two-process ring suite and `PASS mapped shared-file transfer across three JVMs and post-exit cleanup`. The host has no locally installed Java runtime. The earlier file-backed-only commit `9f320df` passed the existing hosted Ubuntu, macOS, and Windows workflow (run `41543791667`); that run does not validate the new mapped backend. The mapped implementation still needs a fresh hosted CI run on all three operating systems before platform support is claimed.
+
+## Scope and limits
+
+- SPSC only; no MPMC, durable queue, distributed shared memory, JNI/JNA, or named OS shared-memory backend.
+- The path must refer to the same file for every JVM. Network filesystems and cross-host use are unsupported.
+- `force()` and file locking prioritize clear ordering and correctness over low latency; benchmark only after the semantics and OS behavior are validated.
+- No C++ interoperability is claimed. Agree a serialized ABI and cross-language synchronization protocol separately before attempting it.
+- An abnormal peer exit can leave an incomplete operation. Fail the session and recreate it under a new path; do not assume recoverability.
