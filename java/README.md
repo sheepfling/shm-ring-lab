@@ -44,5 +44,7 @@ On 2026-11-02, `bash scripts/test.sh` passed in an official Eclipse Temurin
 17.0.20.1 JDK container on LinuxKit 7.0.12 / aarch64. The test covered FIFO,
 wraparound, full and empty deadlines, cross-process file-lock contention,
 writer close, and a 500-message producer/consumer transfer between separate
-JVMs. This is container evidence; native macOS, Linux-host, and Windows CI runs
-remain pending.
+JVMs. The same bounded test passed in GitHub Actions on `ubuntu-latest`,
+`macos-latest`, and `windows-latest` for commit `9f320df` (run
+41543791667). These are hosted OS results; this Mac has no locally installed
+Java runtime.
