@@ -22,7 +22,7 @@ With Docker Engine or Docker Desktop already running:
 bash scripts/docker-linux-proof.sh
 ```
 
-The script builds a Debian Bookworm image, builds the project inside it, runs all eight CTest scenarios three times, then starts a host, producer, and consumer as separate processes. The process proof sends 5,000 ordered frames, checks the received count and full byte stream, and prints the SHA-256 digest. The container reports its actual OS, architecture, compiler, and CMake versions. It does not change Docker daemon networking or security settings.
+The script builds a Debian Bookworm image, builds the project inside it, runs all nine current CTest scenarios three times, then starts a host, producer, and consumer as separate processes. The process proof sends 5,000 ordered frames, checks the received count and full byte stream, and prints the SHA-256 digest. The container reports its actual OS, architecture, compiler, and CMake versions. It does not change Docker daemon networking or security settings.
 
 ### Windows (Visual Studio 2022 / MSVC)
 
@@ -129,11 +129,11 @@ build\windows-msvc-x64\Release\shm_ring_demo.exe cleanup showcase
 
 | Platform | Backend in the project | Verification status |
 | --- | --- | --- |
-| macOS | POSIX shared memory and named semaphore | On 2026-10-11, a native build and all 8 process-level correctness scenarios passed on macOS 26.6.2 arm64 with Apple Clang 21.0.0; the suite passed 3 consecutive runs. |
-| Linux | POSIX shared memory and named semaphore | On 2026-10-11, the Docker proof passed in Debian 12 (Bookworm) on LinuxKit 7.0.12 / aarch64, with GCC 12.2.0 and CMake 3.25.1: all 8 CTest scenarios passed 3 times, then 5,000 separate-process messages passed count, byte, and SHA-256 checks. |
-| Windows | Win32 file mapping and named mutex | MSVC x64 preset and PB-MSI checklist are present; a native build and tests have not yet run. |
+| macOS | POSIX shared memory and named semaphore | On 2026-11-02, the native Apple Silicon build passed all 9 process-level correctness scenarios with Apple Clang 21.0.0 and CMake 4.4.4. The earlier 2026-10-11 three-run result covered 8 scenarios. |
+| Linux | POSIX shared memory and named semaphore | On 2026-11-02, the Docker proof passed in Debian 12 (Bookworm) on LinuxKit 7.0.12 / aarch64, with GCC 12.2.0 and CMake 3.25.1: all 9 current CTest scenarios passed 3 times, then 5,000 separate-process messages passed count, byte, and SHA-256 checks. This remains container evidence, not a native Linux host run. |
+| Windows | Win32 file mapping and named mutex | CMake MSVC x64 preset, PB-MSI checklist, and a GitHub Actions Windows job are present. No result from the new hosted Windows job is recorded yet; the native checklist remains outstanding. |
 
-The Docker run proves the Linux aarch64 container route; it does not replace a native Linux host run. Windows still needs the PB-MSI native run. See [the verification backlog](docs/verification-backlog.md) for the remaining checks.
+The Docker run proves the Linux aarch64 container route; it does not replace a native Linux host run. The new GitHub Actions matrix will add hosted Windows and macOS results when it completes; Windows still needs the detailed PB-MSI session-identity run. See [the verification backlog](docs/verification-backlog.md) for the remaining checks.
 
 ## How it works
 

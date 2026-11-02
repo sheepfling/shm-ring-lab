@@ -1,8 +1,8 @@
 # Verification backlog
 
-This backlog combines dated local results with the current review state. Draft PR #1 publishes the base C++ project and Python tutorial on `feature/initial-work`; the October 18 paired IPC benchmark remains separate local work and is not included in the PR.
+This backlog combines dated local results with the current review state. Draft PR #1 publishes the base C++ project and Python tutorial on `feature/initial-work`; the October 18 paired IPC benchmark remains separate local work and is not included in the PR. GitHub Actions now builds and runs CTest on hosted Ubuntu, macOS, and Windows runners for pull requests.
 
-The October 30 check found no PR reviews, status contexts, or PR-triggered workflow runs. Do not treat the dated local runs below as CI results. No Umbra integration is part of this project. Record actual compiler/OS and exact command output when advancing a phase.
+The October 30 check found no PR reviews, status contexts, or PR-triggered workflow runs at that time. Do not treat dated local runs below as CI results. No Umbra integration is part of this project. Record actual compiler/OS and exact command output when advancing a phase.
 
 ## Phase 0 — local macOS development
 
@@ -16,6 +16,8 @@ The October 30 check found no PR reviews, status contexts, or PR-triggered workf
 - [x] 2026-10-11: ran the new 5,000-frame process-proof harness against the native macOS demo binary: 5,000 messages, 165,000 bytes, matching SHA-256 `29ac1b5138c2db00f5a2710813afc39a188e77496b56b9ce19c60d2c6db65507`. This validates the harness on macOS only, not Linux.
 - [x] Separate producer/consumer CLI smoke passed with `hello` and `world`; two-process duplex CLI smoke exchanged one message each way over separate sessions.
 - [ ] Repeat tests on Intel macOS if that architecture is part of the support promise.
+- [ ] Record the first GitHub Actions macOS runner result separately from the local Apple Silicon run.
+- [x] 2026-11-02: Apple Silicon native Release configure/build passed with macOS 26.6.2, Apple Clang 21.0.0, and CMake 4.4.4. CTest passed 1/1 registered test, covering all 9 process scenarios (13.48 s). Initial sandboxed test setup hit `shm_open` `errno 1`; the same bounded CTest command passed after per-command approval. Exact commands: `cmake -S . -B /tmp/shm-ring-lab-final-build -DCMAKE_BUILD_TYPE=Release`; `cmake --build /tmp/shm-ring-lab-final-build --config Release --parallel 2`; `ctest --test-dir /tmp/shm-ring-lab-final-build --build-config Release --output-on-failure`.
 
 ## Phase 1 — Linux target validation
 
@@ -25,6 +27,8 @@ The October 30 check found no PR reviews, status contexts, or PR-triggered workf
 - [ ] Run all CTest correctness scenarios with process deadlines; repeat under a second compiler (GCC/Clang) where available.
 - [ ] Verify `shm_open`, `sem_open`, permissions, cleanup after normal exit, and bounded timeout after the `crash-lock` helper exits while holding the semaphore.
 - [ ] Run sanitizers for process-local memory errors where supported; do not interpret them as crash-recovery proof.
+- [ ] Record a successful hosted Ubuntu runner result as native Linux CI evidence; keep the October 11 Docker result labeled as container evidence.
+- [x] 2026-11-02: Docker Desktop 29.8.0 ran the updated proof in Debian 12 / LinuxKit 7.0.12 / aarch64 with GCC 12.2.0 and CMake 3.25.1. Build passed; all 9 CTest scenarios passed 3 consecutive repetitions (36.47 s total); the separate-process proof passed 5,000 messages / 165,000 bytes with SHA-256 `29ac1b5138c2db00f5a2710813afc39a188e77496b56b9ce19c60d2c6db65507`. Command: `bash scripts/docker-linux-proof.sh`. This is container evidence, not native Linux host validation.
 
 ## Phase 2 — Windows target validation
 
@@ -33,6 +37,12 @@ The October 30 check found no PR reviews, status contexts, or PR-triggered workf
 - [ ] Run all process tests, including `WAIT_ABANDONED`, `Local\` object naming, process termination, duplex, cleanup-after-final-handle, and timeout behavior.
 - [ ] Repeat from two terminals under the same user logon session and confirm a second user/session cannot accidentally join the object.
 - [ ] Check x64 first; add ARM64 only if it is a stated target.
+- [ ] Record the hosted Windows runner's exact MSVC/SDK versions and CTest result; CI coverage is not yet execution evidence until the workflow completes.
+- [ ] Complete the PB-MSI same-session and different-session checklist. Hosted CI does not cover this identity/security boundary.
+
+## Current cleanup note
+
+- [x] 2026-11-02: POSIX test-child teardown now sends `SIGKILL` and polls `waitpid(WNOHANG)` for at most 5 seconds instead of waiting indefinitely. If the kernel does not reap the child by then, the test prints a diagnostic and returns control so the enclosing worker can exit and the OS can finish reaping. Current macOS and Docker Linux correctness suites passed with this change.
 
 ## Phase 3 — protocol hardening and bounded next milestone
 

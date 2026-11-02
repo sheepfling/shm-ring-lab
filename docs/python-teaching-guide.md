@@ -230,11 +230,12 @@ lock-free backend.
 
 ## Validation status for this checkout
 
-Validated on macOS with Python 3.12.3, Apple Clang 21.0.0, and CMake 4.4.4.
+The tutorial-specific checks were validated on macOS with Python 3.12.3,
+Apple Clang 21.0.0, and CMake 4.4.4 against the initial tutorial version.
 The threaded suite passed 5 named cases; the process suite passed all 6 named
 cases, including the spawned child's clean exit and shared-memory unlink
 cleanup. Both demos passed FIFO ordering. The native C++ CTest entry passed all
-8 correctness scenarios.
+8 correctness scenarios at the time of the tutorial validation.
 
 The initial default-sandbox process and CTest attempts returned
 `PermissionError` / `EPERM` from shared-memory creation. The exact commands
@@ -249,11 +250,16 @@ python3 examples/python/process_spsc.py --test
 ```
 
 The native C++ build had already succeeded. CTest's one registered test
-contains eight scenarios; all eight passed with the approved invocation:
+contained eight scenarios at that time; all eight passed with the approved invocation:
 
 ```sh
 ctest --test-dir /tmp/shm-ring-lab-build --output-on-failure
 ```
+
+The current C++ suite has since added a bounded duplex CLI teardown scenario.
+On 2026-11-02, the current native macOS CTest run passed all 9 scenarios; the
+current Debian Bookworm Docker/LinuxKit run passed all 9 scenarios three times.
+These later results validate the current C++ suite, not the Python tutorial.
 
 The build directory was `/tmp/shm-ring-lab-build`; Python was
 `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`. The temporary

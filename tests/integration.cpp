@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -276,8 +277,20 @@ public:
     void terminate() noexcept {
         if (!finished_ && pid_ > 0) {
             (void)::kill(watchdog_group_ ? -pid_ : pid_, SIGKILL);
-            int status = 0;
-            while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+            const auto deadline = std::chrono::steady_clock::now() + 5s;
+            for (;;) {
+                int status = 0;
+                const auto result = ::waitpid(pid_, &status, WNOHANG);
+                if (result == pid_ || (result < 0 && errno != EINTR)) break;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    std::fprintf(stderr,
+                                 "child %ld did not reap within 5 seconds after SIGKILL; "
+                                 "leaving final cleanup to the operating system\n",
+                                 static_cast<long>(pid_));
+                    break;
+                }
+                std::this_thread::sleep_for(5ms);
+            }
             finished_ = true;
         }
     }
