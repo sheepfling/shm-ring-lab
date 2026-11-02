@@ -43,7 +43,9 @@ On 2026-11-02, the original and mapped test suites passed in the Eclipse Temurin
 docker run --rm -v "$PWD":/src -w /src eclipse-temurin:17-jdk bash scripts/test.sh
 ```
 
-The passing output included the original two-process ring suite and `PASS mapped shared-file transfer across three JVMs and post-exit cleanup`. The host has no locally installed Java runtime. GitHub Actions run `41546196988` passed the updated suite on `ubuntu-latest`, `macos-latest`, and `windows-latest` for mapped-backend commit `38e26f015c7dee316f037ef3fe977a71cf5ed581`. Earlier file-backed-only run `41543791667` covered commit `9f320df` and did not validate the mapped backend.
+The final local rerun passed the original two-process suite and the mapped transfer, 32 MiB sparse-map poll, concurrent-close, and post-exit cleanup checks after removing all `load()`/`force()` calls from the mapped implementation. The host has no locally installed Java runtime. GitHub Actions run `41547387473` passed the full updated suite on `ubuntu-latest`, `macos-latest`, and `windows-latest` for PR head `bc9d7921d8ebec9881ae54e8072810c3c969b9e5`, including the mapping/close changes. Earlier mapped implementation runs `41546196988` and `41546334565` preceded those changes; file-backed-only run `41543791667` covered commit `9f320df` and did not validate the mapped backend.
+
+The synchronization limits above follow the JDK 17 contracts for [`MappedByteBuffer`](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/nio/MappedByteBuffer.html), [`FileChannel`](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/nio/channels/FileChannel.html), and [`FileLock`](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/nio/channels/FileLock.html). These APIs do not promise a portable cross-JVM happens-before edge for mapped accesses.
 
 ## Scope and limits
 
